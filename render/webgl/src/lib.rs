@@ -1077,13 +1077,13 @@ impl WebGlRenderBackend {
                 }
             }
             let short_run = batch.pending.len() < BATCH_MIN_PIECES;
-            let slot = batch.slots.get_mut(slot_index).filter(|slot| {
-                if slot.cooldown > 0 {
+            let slot = match batch.slots.get_mut(slot_index) {
+                Some(slot) if slot.cooldown > 0 => {
                     slot.cooldown -= 1;
-                    return false;
+                    None
                 }
-                true
-            });
+                other => other,
+            };
             let slot = if short_run { None } else { slot };
             if let Some(slot) = slot {
                 let same = slot.keys.len() == batch.pending.len()
