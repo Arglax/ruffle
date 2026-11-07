@@ -660,6 +660,10 @@ impl<'gc> Library<'gc> {
     /// MVS: run at the start of each collection step: libraries made since the last step (other
     /// than the root movie's) move into their own allocations, held weakly from then on.
     pub fn mvs_prepare(&mut self, mc: &Mutation<'gc>, root: SwfMovie<'gc>) {
+        // EXPERIMENT (AVM1 crash hunt): keep every library strongly owned, as upstream does.
+        if true {
+            return;
+        }
         let root = root.as_ptr() as usize;
         let keys: Vec<usize> = self
             .movie_libraries
