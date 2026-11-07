@@ -1,0 +1,82 @@
+# Arglax fork: builds the self-hosted web package (ruffle.js + wasm) on every push to the
+# arglax branches, so the apps (DreamQuest, MoVibeSkua) can take a build without compiling
+# Ruffle locally. The package is attached to the run as an artifact; a tag `arglax-v*`
+# also publishes it as a release.
+name: Arglax web build
+
+on:
+  push:
+    branches: [arglax, "arglax-*"]
+    tags: ["arglax-v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arglax-web
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # Must match the wasm-bindgen crate version in Cargo.lock.
+      - name: Install wasm-bindgen
+        run: cargo install --locked wasm-bindgen-cli --version 0.2.127
+
+      - name: Install wasm-opt
+        uses: sigoden/install-binary@v1
+        with:
+          repo: WebAssembly/binaryen
+          tag: version_129
+          name: wasm-opt
+
+      - name: Install node packages
+        working-directory: web
+        run: npm ci
+
+      # The WebAssembly-extensions build only (Android WebView and current browsers have it).
+      - name: Build web
+        working-directory: web
+        env:
+          CARGO_FEATURES: lzma,jpegxr
+        run: |
+          npm run build --workspace=ruffle-core
+          npm run build --workspace=ruffle-selfhosted
+
+      - name: Package
+        working-directory: web/packages/selfhosted/dist
+        run: |
+          echo "${GITHUB_REF_NAME} ${GITHUB_SHA::8}" > VERSION-ARGLAX
+          zip -r "$GITHUB_WORKSPACE/ruffle-arglax-selfhosted.zip" . -x '*.map'
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ruffle-arglax-selfhosted-${{ github.sha }}
+          path: ruffle-arglax-selfhosted.zip
+
+      - name: Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/arglax-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" ruffle-arglax-selfhosted.zip --prerelease --title "$GITHUB_REF_NAME" --notes "Arglax fork build of $GITHUB_SHA"
