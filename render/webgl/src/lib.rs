@@ -48,6 +48,12 @@ const BATCH_FLUSH_VERTICES: usize = 65536;
 /// Batches kept from one frame to the next (each with its own GPU buffers); later ones in a frame are
 /// built every time.
 const BATCH_SLOTS: usize = 1024;
+/// Runs shorter than this are drawn piece by piece: too few calls saved to pay for building a batch.
+const BATCH_MIN_PIECES: usize = 8;
+/// A slot rebuilt this many frames in a row (its pieces keep moving) stops batching; it is tried
+/// again every BATCH_RETRY_FRAMES frames.
+const BATCH_MAX_REBUILDS: u32 = 3;
+const BATCH_RETRY_FRAMES: u32 = 30;
 
 static NEXT_CPU_MESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use wasm_bindgen::{JsCast, JsValue};
@@ -937,6 +943,8 @@ impl WebGlRenderBackend {
             },
             keys: Vec::new(),
             num_indices: 0,
+            rebuilds: 0,
+            cooldown: 0,
         })
     }
 
@@ -1068,9 +1076,23 @@ impl WebGlRenderBackend {
                     Err(e) => log::warn!("Could not make a batch slot: {e}"),
                 }
             }
-            if let Some(slot) = batch.slots.get_mut(slot_index) {
+            let short_run = batch.pending.len() < BATCH_MIN_PIECES;
+            let slot = batch.slots.get_mut(slot_index).filter(|slot| {
+                if slot.cooldown > 0 {
+                    slot.cooldown -= 1;
+                    return false;
+                }
+                true
+            });
+            let slot = if short_run { None } else { slot };
+            if let Some(slot) = slot {
                 let same = slot.keys.len() == batch.pending.len()
                     && slot.keys.iter().zip(&batch.pending).all(|(k, p)| *k == p.key);
+                if same {
+                    slot.rebuilds = 0;
+                } else {
+                    slot.rebuilds += 1;
+                }
                 self.bind_vertex_array(Some(&slot.vao));
                 if !same {
                     Self::batch_build(
@@ -1095,6 +1117,13 @@ impl WebGlRenderBackend {
                     slot.keys.clear();
                     slot.keys.extend(batch.pending.iter().map(|p| p.key));
                     slot.num_indices = batch.scratch_indices.len() as i32;
+                    if slot.rebuilds >= BATCH_MAX_REBUILDS {
+                        // Keeps changing: building it costs more than the calls it saves. Draw
+                        // this run piece by piece for a while.
+                        slot.rebuilds = 0;
+                        slot.cooldown = BATCH_RETRY_FRAMES;
+                        slot.keys.clear();
+                    }
                 }
                 if slot.num_indices > 0 {
                     self.gl.draw_elements_with_i32(
@@ -1105,7 +1134,8 @@ impl WebGlRenderBackend {
                     );
                 }
             } else {
-                // Past the kept slots (or none could be made): draw each piece on its own.
+                // A short run, a run that keeps changing, or past the kept slots: draw each piece on
+                // its own, as without batching.
                 for piece in &batch.pending {
                     let draw = &as_mesh(&piece.shape).draws[piece.draw];
                     let k = &piece.key;
@@ -2830,6 +2860,10 @@ struct BatchSlot {
     index_buffer: Buffer,
     keys: Vec<PieceKey>,
     num_indices: i32,
+    /// Frames in a row this slot had to be rebuilt.
+    rebuilds: u32,
+    /// Frames left before a slot that stopped batching tries again.
+    cooldown: u32,
 }
 
 #[derive(Debug)]
