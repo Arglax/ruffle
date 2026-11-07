@@ -665,7 +665,13 @@ impl<'gc> Library<'gc> {
             .movie_libraries
             .slots
             .iter()
-            .filter(|(key, slot)| **key != root && matches!(slot, LibSlot::Fresh(_)))
+            .filter(|(key, slot)| {
+                // Only AVM2 movies' libraries are freed (proven on AQW). AVM1 games such as
+                // DragonFable crashed with them held weakly ("memory access out of bounds" in
+                // `Drawing::clone` while instantiating a library symbol, then "null function"),
+                // so their libraries stay owned here for good, as upstream keeps them.
+                **key != root && matches!(slot, LibSlot::Fresh(lib) if lib.swf.is_action_script_3())
+            })
             .map(|(key, _)| *key)
             .collect();
         for key in keys {
