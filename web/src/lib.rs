@@ -1154,6 +1154,9 @@ impl RuffleHandle {
                     .is_some_and(|v| v.is_truthy())
             };
             ruffle_core::mvs_set_freeze(flag("__mvsFreezeHidden"), flag("__mvsFreezeOrphans"));
+            // Arglax: draw batching in the WebGL renderer, off with window.__arglaxNoBatch (A/B tests).
+            #[cfg(feature = "webgl")]
+            ruffle_render_webgl::arglax_set_batching(!flag("__arglaxNoBatch"));
             // MVS: window.__mvsKeepLibraries keeps every loaded movie's library forever (upstream).
             ruffle_core::mvs_set_free_libraries(!flag("__mvsKeepLibraries"));
             // MVS: window.__mvsAs3Consts ({"Class.NAME": number}) replaces class constants; read once,
