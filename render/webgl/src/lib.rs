@@ -27,6 +27,24 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use swf::{BlendMode, Color, Twips};
 use thiserror::Error;
+
+/// Arglax: whether plain-colour shape pieces are batched (see `flush_batch`). On by default; the
+/// page can turn it off with `window.__arglaxNoBatch` for A/B tests (web/src/lib.rs).
+static ARGLAX_BATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn arglax_set_batching(on: bool) {
+    ARGLAX_BATCHING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn arglax_batching() -> bool {
+    ARGLAX_BATCHING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A colour piece with more vertices than this is drawn on its own (transforming it on the CPU
+/// would cost more than the draw call it saves).
+const BATCH_MAX_PIECE_VERTICES: usize = 4096;
+/// A batch is drawn once it holds this many vertices.
+const BATCH_FLUSH_VERTICES: usize = 65536;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
     HtmlCanvasElement, OesVertexArrayObject, WebGl2RenderingContext as Gl2, WebGlBuffer,
@@ -154,6 +172,8 @@ pub struct WebGlRenderBackend {
     /// WebAssembly into the browser; together they were over a tenth of the CPU time in busy scenes.
     mvs_world: Option<[[f32; 4]; 4]>,
     mvs_gradient: *const u8,
+    /// Arglax: plain-colour shape pieces waiting to be drawn in one call (see `flush_batch`).
+    batch: Option<ColorBatch>,
 
     renderbuffer_width: i32,
     renderbuffer_height: i32,
@@ -420,11 +440,19 @@ impl WebGlRenderBackend {
             add_color: None,
             mvs_world: None,
             mvs_gradient: std::ptr::null(),
+            batch: None,
 
             viewport_scale_factor: 1.0,
         };
 
         renderer.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
+        renderer.batch = match renderer.build_color_batch() {
+            Ok(batch) => Some(batch),
+            Err(e) => {
+                log::warn!("Draw batching unavailable: {e}");
+                None
+            }
+        };
 
         let mut color_quad_mesh = renderer.build_quad_mesh(&renderer.color_program)?;
         let mut bitmap_quad_mesh = renderer.build_quad_mesh(&renderer.bitmap_program)?;
@@ -509,6 +537,7 @@ impl WebGlRenderBackend {
 
         let mut draws = vec![];
         draws.push(Draw {
+            cpu: None,
             draw_type: if program.program == self.bitmap_program.program {
                 DrawType::Bitmap(BitmapDraw {
                     matrix: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -690,6 +719,14 @@ impl WebGlRenderBackend {
             self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vertex_buffer));
 
             let vertices: Vec<_> = draw.vertices.into_iter().map(Vertex::from).collect();
+            let cpu = (matches!(draw.draw_type, TessDrawType::Color)
+                && vertices.len() <= BATCH_MAX_PIECE_VERTICES)
+                .then(|| {
+                    Box::new(CpuMesh {
+                        vertices: vertices.clone(),
+                        indices: draw.indices.clone(),
+                    })
+                });
             self.gl.buffer_data_with_u8_array(
                 Gl::ARRAY_BUFFER,
                 bytemuck::cast_slice(&vertices),
@@ -746,6 +783,7 @@ impl WebGlRenderBackend {
             draws.push(match draw.draw_type {
                 TessDrawType::Color => Draw {
                     draw_type: DrawType::Color,
+                    cpu,
                     vao,
                     vertex_buffer: Buffer {
                         gl: self.gl.clone(),
@@ -759,6 +797,7 @@ impl WebGlRenderBackend {
                     num_mask_indices,
                 },
                 TessDrawType::Gradient { matrix, gradient } => Draw {
+                    cpu: None,
                     draw_type: DrawType::Gradient(Box::new(Gradient::new(
                         lyon_mesh.gradients[gradient].clone(), // TODO: Gradient deduplication
                         matrix,
@@ -776,6 +815,7 @@ impl WebGlRenderBackend {
                     num_mask_indices,
                 },
                 TessDrawType::Bitmap(bitmap) => Draw {
+                    cpu: None,
                     draw_type: DrawType::Bitmap(BitmapDraw {
                         matrix: bitmap.matrix,
                         handle: bitmap_source.bitmap_handle(bitmap.bitmap_id, self),
@@ -831,6 +871,168 @@ impl WebGlRenderBackend {
         } else {
             self.vao_ext.bind_vertex_array_oes(vao);
         };
+    }
+
+    /// Arglax: the batch's vertex array, laid out for the colour program like any colour piece.
+    fn build_color_batch(&self) -> Result<ColorBatch, Error> {
+        let vao = self.create_vertex_array()?;
+        let vertex_buffer = self.gl.create_buffer().ok_or(Error::UnableToCreateBuffer)?;
+        self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vertex_buffer));
+        let index_buffer = self.gl.create_buffer().ok_or(Error::UnableToCreateBuffer)?;
+        self.gl
+            .bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&index_buffer));
+        let program = &self.color_program;
+        if program.vertex_position_location != 0xffff_ffff {
+            self.gl.vertex_attrib_pointer_with_i32(
+                program.vertex_position_location,
+                2,
+                Gl::FLOAT,
+                false,
+                12,
+                0,
+            );
+            self.gl
+                .enable_vertex_attrib_array(program.vertex_position_location);
+        }
+        if program.vertex_color_location != 0xffff_ffff {
+            self.gl.vertex_attrib_pointer_with_i32(
+                program.vertex_color_location,
+                4,
+                Gl::UNSIGNED_BYTE,
+                true,
+                12,
+                8,
+            );
+            self.gl
+                .enable_vertex_attrib_array(program.vertex_color_location);
+        }
+        self.bind_vertex_array(None);
+        Ok(ColorBatch {
+            vao,
+            vertex_buffer: Buffer {
+                gl: self.gl.clone(),
+                buffer: vertex_buffer,
+            },
+            index_buffer: Buffer {
+                gl: self.gl.clone(),
+                buffer: index_buffer,
+            },
+            vertices: Vec::with_capacity(BATCH_FLUSH_VERTICES),
+            indices: Vec::with_capacity(BATCH_FLUSH_VERTICES * 2),
+        })
+    }
+
+    /// Arglax: adds a colour piece to the batch: positions through the world matrix, colours through
+    /// the colour transform, exactly as color.vert does before its premultiply (which still runs on
+    /// the GPU, with an identity world matrix and colour transform).
+    fn batch_append(
+        &mut self,
+        cpu: &CpuMesh,
+        transform: &Transform,
+        mult: [f32; 4],
+        add: [f32; 4],
+        num_indices: usize,
+    ) {
+        if self
+            .batch
+            .as_ref()
+            .is_some_and(|b| b.vertices.len() + cpu.vertices.len() > BATCH_FLUSH_VERTICES)
+        {
+            self.flush_batch();
+        }
+        let Some(batch) = &mut self.batch else {
+            return;
+        };
+        let m = &transform.matrix;
+        let (a, b, c, d) = (m.a, m.b, m.c, m.d);
+        let (tx, ty) = (m.tx.to_pixels() as f32, m.ty.to_pixels() as f32);
+        let plain_color = mult == [1.0; 4] && add == [0.0; 4];
+        let base = batch.vertices.len() as u32;
+        batch.vertices.reserve(cpu.vertices.len());
+        for v in &cpu.vertices {
+            let [x, y] = v.position;
+            let color = if plain_color {
+                v.color
+            } else {
+                let ch = v.color.to_le_bytes();
+                let mut out = [0u8; 4];
+                for i in 0..4 {
+                    let f = (ch[i] as f32 / 255.0) * mult[i] + add[i];
+                    out[i] = (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+                u32::from_le_bytes(out)
+            };
+            batch.vertices.push(Vertex {
+                position: [a * x + c * y + tx, b * x + d * y + ty],
+                color,
+            });
+        }
+        batch
+            .indices
+            .extend(cpu.indices[..num_indices].iter().map(|i| base + i));
+    }
+
+    /// Arglax: draws the pending batch, if any. Called before anything else is drawn, before the
+    /// mask, blend or target state changes, and at the end of every command list.
+    fn flush_batch(&mut self) {
+        let Some(mut batch) = self.batch.take() else {
+            return;
+        };
+        if !batch.indices.is_empty() {
+            self.set_stencil_state();
+            let program = &self.color_program;
+            if !std::ptr::eq(program, self.active_program) {
+                self.gl.use_program(Some(&program.program));
+                self.active_program = program as *const ShaderProgram;
+                program.uniform_matrix4fv(&self.gl, ShaderUniform::ViewMatrix, &self.view_matrix);
+                self.mult_color = None;
+                self.add_color = None;
+                self.mvs_world = None;
+                self.mvs_gradient = std::ptr::null();
+            }
+            let identity = [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            if self.mvs_world != Some(identity) {
+                program.uniform_matrix4fv(&self.gl, ShaderUniform::WorldMatrix, &identity);
+                self.mvs_world = Some(identity);
+            }
+            if self.mult_color != Some([1.0; 4]) {
+                program.uniform4fv(&self.gl, ShaderUniform::MultColor, &[1.0; 4]);
+                self.mult_color = Some([1.0; 4]);
+            }
+            if self.add_color != Some([0.0; 4]) {
+                program.uniform4fv(&self.gl, ShaderUniform::AddColor, &[0.0; 4]);
+                self.add_color = Some([0.0; 4]);
+            }
+            self.bind_vertex_array(Some(&batch.vao));
+            self.gl
+                .bind_buffer(Gl::ARRAY_BUFFER, Some(&batch.vertex_buffer.buffer));
+            self.gl.buffer_data_with_u8_array(
+                Gl::ARRAY_BUFFER,
+                bytemuck::cast_slice(&batch.vertices),
+                Gl::STREAM_DRAW,
+            );
+            self.gl
+                .bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&batch.index_buffer.buffer));
+            self.gl.buffer_data_with_u8_array(
+                Gl::ELEMENT_ARRAY_BUFFER,
+                bytemuck::cast_slice(&batch.indices),
+                Gl::STREAM_DRAW,
+            );
+            self.gl.draw_elements_with_i32(
+                Gl::TRIANGLES,
+                batch.indices.len() as i32,
+                Gl::UNSIGNED_INT,
+                0,
+            );
+            batch.vertices.clear();
+            batch.indices.clear();
+        }
+        self.batch = Some(batch);
     }
 
     fn set_stencil_state(&self) {
@@ -1150,6 +1352,7 @@ impl WebGlRenderBackend {
             });
         }
         commands.execute(self);
+        self.flush_batch();
         if pooled.is_some() {
             self.targets.pop();
         }
@@ -1357,12 +1560,14 @@ impl WebGlRenderBackend {
     }
 
     fn push_blend_mode(&mut self, blend: RenderBlendMode) {
+        self.flush_batch();
         if !same_blend_mode(self.blend_modes.last(), &blend) {
             self.apply_blend_mode(blend.clone());
         }
         self.blend_modes.push(blend);
     }
     fn pop_blend_mode(&mut self) {
+        self.flush_batch();
         let old = self.blend_modes.pop();
         // We never pop our base 'BlendMode::Normal'
         let current = self
@@ -1497,6 +1702,7 @@ impl WebGlRenderBackend {
     fn blend_with_layer(&mut self, commands: CommandList, code: i32) {
         let (Some(top), Some(gl2)) = (self.targets.last().cloned(), self.gl2.clone()) else {
             commands.execute(self);
+            self.flush_batch();
             return;
         };
         if let Err(e) = self.ensure_layer(&gl2, top.pool, top.depth) {
@@ -1504,6 +1710,7 @@ impl WebGlRenderBackend {
             gl2.bind_framebuffer(Gl2::FRAMEBUFFER, Some(&top.framebuffer));
             self.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
             commands.execute(self);
+            self.flush_batch();
             self.pop_blend_mode();
             return;
         }
@@ -1526,6 +1733,7 @@ impl WebGlRenderBackend {
         });
         self.push_blend_mode(RenderBlendMode::Builtin(BlendMode::Normal));
         commands.execute(self);
+        self.flush_batch();
         self.pop_blend_mode();
         self.targets.pop();
 
@@ -1737,6 +1945,7 @@ impl RenderBackend for WebGlRenderBackend {
         }
         self.begin_frame(clear);
         commands.execute(self);
+        self.flush_batch();
         self.end_frame();
     }
 
@@ -2003,6 +2212,7 @@ impl CommandHandler for WebGlRenderBackend {
         pixel_snapping: PixelSnapping,
         region: PixelRegion,
     ) {
+        self.flush_batch();
         self.set_stencil_state();
         let entry = as_registry_data(&bitmap);
         // Adjust the quad draw to use the target bitmap.
@@ -2126,6 +2336,14 @@ impl CommandHandler for WebGlRenderBackend {
                 continue;
             }
 
+            if let (DrawType::Color, Some(cpu)) = (&draw.draw_type, &draw.cpu) {
+                if self.batch.is_some() && arglax_batching() {
+                    self.batch_append(cpu, &transform, mult_color, add_color, num_indices as usize);
+                    continue;
+                }
+            }
+            self.flush_batch();
+
             self.bind_vertex_array(Some(&draw.vao));
 
             let program = match &draw.draw_type {
@@ -2247,26 +2465,31 @@ impl CommandHandler for WebGlRenderBackend {
     }
 
     fn render_stage3d(&mut self, _bitmap: BitmapHandle, _transform: Transform) {
+        self.flush_batch();
         panic!("Stage3D should not have been created on WebGL backend")
     }
 
     fn draw_rect(&mut self, color: Color, matrix: Matrix) {
+        self.flush_batch();
         self.draw_quad::<{ Gl::TRIANGLE_FAN }, -1>(color, matrix)
     }
 
     fn draw_line(&mut self, color: Color, mut matrix: Matrix) {
+        self.flush_batch();
         matrix.tx += Twips::HALF_PX;
         matrix.ty += Twips::HALF_PX;
         self.draw_quad::<{ Gl::LINE_STRIP }, 2>(color, matrix)
     }
 
     fn draw_line_rect(&mut self, color: Color, mut matrix: Matrix) {
+        self.flush_batch();
         matrix.tx += Twips::HALF_PX;
         matrix.ty += Twips::HALF_PX;
         self.draw_quad::<{ Gl::LINE_LOOP }, -1>(color, matrix)
     }
 
     fn push_mask(&mut self) {
+        self.flush_batch();
         debug_assert!(
             self.mask_state == MaskState::NoMask || self.mask_state == MaskState::DrawMaskedContent
         );
@@ -2276,18 +2499,21 @@ impl CommandHandler for WebGlRenderBackend {
     }
 
     fn activate_mask(&mut self) {
+        self.flush_batch();
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskStencil);
         self.mask_state = MaskState::DrawMaskedContent;
         self.mask_state_dirty = true;
     }
 
     fn deactivate_mask(&mut self) {
+        self.flush_batch();
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::DrawMaskedContent);
         self.mask_state = MaskState::ClearMaskStencil;
         self.mask_state_dirty = true;
     }
 
     fn pop_mask(&mut self) {
+        self.flush_batch();
         debug_assert!(self.num_masks > 0 && self.mask_state == MaskState::ClearMaskStencil);
         self.num_masks -= 1;
         self.mask_state = if self.num_masks == 0 {
@@ -2299,6 +2525,7 @@ impl CommandHandler for WebGlRenderBackend {
     }
 
     fn blend(&mut self, commands: CommandList, blend: RenderBlendMode) {
+        self.flush_batch();
         if let RenderBlendMode::Builtin(mode) = &blend {
             if let Some(code) = complex_blend_code(*mode) {
                 if self.blend_layer_ready() {
@@ -2309,12 +2536,14 @@ impl CommandHandler for WebGlRenderBackend {
         }
         self.push_blend_mode(blend);
         commands.execute(self);
+        self.flush_batch();
         self.pop_blend_mode();
     }
 
     fn render_alpha_mask(&mut self, maskee_commands: CommandList, _mask_commands: CommandList) {
         // TODO Add support for alpha masks
         maskee_commands.execute(self);
+        self.flush_batch();
     }
 }
 
@@ -2428,6 +2657,9 @@ impl Drop for Buffer {
 #[derive(Debug)]
 struct Draw {
     draw_type: DrawType,
+    /// Arglax: the piece's vertices and indices, kept for small plain-colour pieces so they can be
+    /// batched.
+    cpu: Option<Box<CpuMesh>>,
     #[expect(dead_code)]
     vertex_buffer: Buffer,
     #[expect(dead_code)]
@@ -2435,6 +2667,25 @@ struct Draw {
     vao: WebGlVertexArrayObject,
     num_indices: i32,
     num_mask_indices: i32,
+}
+
+/// Arglax: a plain-colour piece's geometry as uploaded, in shape space.
+#[derive(Debug)]
+struct CpuMesh {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
+/// Arglax: consecutive plain-colour pieces, transformed and coloured on the CPU into one buffer and
+/// drawn with a single call. Upstream draws each piece on its own (a vertex array bind, its world
+/// matrix and colour uniforms and a drawElements each): about 3,000 times a picture in DragonFable's
+/// towns, every call a trip from WebAssembly through JavaScript to the GPU process.
+struct ColorBatch {
+    vao: WebGlVertexArrayObject,
+    vertex_buffer: Buffer,
+    index_buffer: Buffer,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
 }
 
 #[derive(Debug)]
