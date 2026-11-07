@@ -45,6 +45,11 @@ fn arglax_batching() -> bool {
 const BATCH_MAX_PIECE_VERTICES: usize = 4096;
 /// A batch is drawn once it holds this many vertices.
 const BATCH_FLUSH_VERTICES: usize = 65536;
+/// Batches kept from one frame to the next (each with its own GPU buffers); later ones in a frame are
+/// built every time.
+const BATCH_SLOTS: usize = 1024;
+
+static NEXT_CPU_MESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
     HtmlCanvasElement, OesVertexArrayObject, WebGl2RenderingContext as Gl2, WebGlBuffer,
@@ -723,6 +728,7 @@ impl WebGlRenderBackend {
                 && vertices.len() <= BATCH_MAX_PIECE_VERTICES)
                 .then(|| {
                     Box::new(CpuMesh {
+                        id: NEXT_CPU_MESH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         vertices: vertices.clone(),
                         indices: draw.indices.clone(),
                     })
@@ -873,8 +879,20 @@ impl WebGlRenderBackend {
         };
     }
 
-    /// Arglax: the batch's vertex array, laid out for the colour program like any colour piece.
+    /// Arglax: the (empty) batch; its slots are made as frames need them.
     fn build_color_batch(&self) -> Result<ColorBatch, Error> {
+        Ok(ColorBatch {
+            pending: Vec::new(),
+            pending_vertices: 0,
+            slots: Vec::new(),
+            next_slot: 0,
+            scratch_vertices: Vec::with_capacity(BATCH_FLUSH_VERTICES),
+            scratch_indices: Vec::with_capacity(BATCH_FLUSH_VERTICES * 2),
+        })
+    }
+
+    /// Arglax: a slot's vertex array, laid out for the colour program like any colour piece.
+    fn build_batch_slot(&self) -> Result<BatchSlot, Error> {
         let vao = self.create_vertex_array()?;
         let vertex_buffer = self.gl.create_buffer().ok_or(Error::UnableToCreateBuffer)?;
         self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&vertex_buffer));
@@ -907,7 +925,7 @@ impl WebGlRenderBackend {
                 .enable_vertex_attrib_array(program.vertex_color_location);
         }
         self.bind_vertex_array(None);
-        Ok(ColorBatch {
+        Ok(BatchSlot {
             vao,
             vertex_buffer: Buffer {
                 gl: self.gl.clone(),
@@ -917,59 +935,92 @@ impl WebGlRenderBackend {
                 gl: self.gl.clone(),
                 buffer: index_buffer,
             },
-            vertices: Vec::with_capacity(BATCH_FLUSH_VERTICES),
-            indices: Vec::with_capacity(BATCH_FLUSH_VERTICES * 2),
+            keys: Vec::new(),
+            num_indices: 0,
         })
     }
 
-    /// Arglax: adds a colour piece to the batch: positions through the world matrix, colours through
-    /// the colour transform, exactly as color.vert does before its premultiply (which still runs on
-    /// the GPU, with an identity world matrix and colour transform).
+    /// Arglax: queues a colour piece for the batch. Nothing is transformed yet: that happens when
+    /// the batch is drawn, and only if the batch differs from the last frame's.
+    #[allow(clippy::too_many_arguments)]
     fn batch_append(
         &mut self,
+        shape: &ShapeHandle,
+        draw: usize,
         cpu: &CpuMesh,
         transform: &Transform,
         mult: [f32; 4],
         add: [f32; 4],
         num_indices: usize,
     ) {
-        if self
-            .batch
-            .as_ref()
-            .is_some_and(|b| b.vertices.len() + cpu.vertices.len() > BATCH_FLUSH_VERTICES)
-        {
+        if self.batch.as_ref().is_some_and(|b| {
+            b.pending_vertices + cpu.vertices.len() > BATCH_FLUSH_VERTICES
+        }) {
             self.flush_batch();
         }
         let Some(batch) = &mut self.batch else {
             return;
         };
         let m = &transform.matrix;
-        let (a, b, c, d) = (m.a, m.b, m.c, m.d);
-        let (tx, ty) = (m.tx.to_pixels() as f32, m.ty.to_pixels() as f32);
-        let plain_color = mult == [1.0; 4] && add == [0.0; 4];
-        let base = batch.vertices.len() as u32;
-        batch.vertices.reserve(cpu.vertices.len());
-        for v in &cpu.vertices {
-            let [x, y] = v.position;
-            let color = if plain_color {
-                v.color
-            } else {
-                let ch = v.color.to_le_bytes();
-                let mut out = [0u8; 4];
-                for i in 0..4 {
-                    let f = (ch[i] as f32 / 255.0) * mult[i] + add[i];
-                    out[i] = (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
-                u32::from_le_bytes(out)
+        batch.pending.push(BatchPiece {
+            shape: shape.clone(),
+            draw,
+            key: PieceKey {
+                mesh: cpu.id,
+                matrix: [
+                    m.a,
+                    m.b,
+                    m.c,
+                    m.d,
+                    m.tx.to_pixels() as f32,
+                    m.ty.to_pixels() as f32,
+                ],
+                mult,
+                add,
+                num_indices: num_indices as u32,
+            },
+        });
+        batch.pending_vertices += cpu.vertices.len();
+    }
+
+    /// Arglax: positions through the world matrix and colours through the colour transform, exactly
+    /// as color.vert does before its premultiply (which still runs on the GPU, with an identity world
+    /// matrix and colour transform).
+    fn batch_build(pending: &[BatchPiece], vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+        vertices.clear();
+        indices.clear();
+        for piece in pending {
+            let Some(cpu) = as_mesh(&piece.shape).draws[piece.draw].cpu.as_deref() else {
+                continue;
             };
-            batch.vertices.push(Vertex {
-                position: [a * x + c * y + tx, b * x + d * y + ty],
-                color,
-            });
+            let k = &piece.key;
+            let [a, b, c, d, tx, ty] = k.matrix;
+            let plain_color = k.mult == [1.0; 4] && k.add == [0.0; 4];
+            let base = vertices.len() as u32;
+            vertices.extend(cpu.vertices.iter().map(|v| {
+                let [x, y] = v.position;
+                let color = if plain_color {
+                    v.color
+                } else {
+                    let ch = v.color.to_le_bytes();
+                    let mut out = [0u8; 4];
+                    for i in 0..4 {
+                        let f = (ch[i] as f32 / 255.0) * k.mult[i] + k.add[i];
+                        out[i] = (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    }
+                    u32::from_le_bytes(out)
+                };
+                Vertex {
+                    position: [a * x + c * y + tx, b * x + d * y + ty],
+                    color,
+                }
+            }));
+            indices.extend(
+                cpu.indices[..k.num_indices as usize]
+                    .iter()
+                    .map(|i| base + i),
+            );
         }
-        batch
-            .indices
-            .extend(cpu.indices[..num_indices].iter().map(|i| base + i));
     }
 
     /// Arglax: draws the pending batch, if any. Called before anything else is drawn, before the
@@ -978,7 +1029,7 @@ impl WebGlRenderBackend {
         let Some(mut batch) = self.batch.take() else {
             return;
         };
-        if !batch.indices.is_empty() {
+        if !batch.pending.is_empty() {
             self.set_stencil_state();
             let program = &self.color_program;
             if !std::ptr::eq(program, self.active_program) {
@@ -1008,29 +1059,79 @@ impl WebGlRenderBackend {
                 program.uniform4fv(&self.gl, ShaderUniform::AddColor, &[0.0; 4]);
                 self.add_color = Some([0.0; 4]);
             }
-            self.bind_vertex_array(Some(&batch.vao));
-            self.gl
-                .bind_buffer(Gl::ARRAY_BUFFER, Some(&batch.vertex_buffer.buffer));
-            self.gl.buffer_data_with_u8_array(
-                Gl::ARRAY_BUFFER,
-                bytemuck::cast_slice(&batch.vertices),
-                Gl::STREAM_DRAW,
-            );
-            self.gl
-                .bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&batch.index_buffer.buffer));
-            self.gl.buffer_data_with_u8_array(
-                Gl::ELEMENT_ARRAY_BUFFER,
-                bytemuck::cast_slice(&batch.indices),
-                Gl::STREAM_DRAW,
-            );
-            self.gl.draw_elements_with_i32(
-                Gl::TRIANGLES,
-                batch.indices.len() as i32,
-                Gl::UNSIGNED_INT,
-                0,
-            );
-            batch.vertices.clear();
-            batch.indices.clear();
+
+            let slot_index = batch.next_slot;
+            batch.next_slot += 1;
+            if slot_index < BATCH_SLOTS && slot_index >= batch.slots.len() {
+                match self.build_batch_slot() {
+                    Ok(slot) => batch.slots.push(slot),
+                    Err(e) => log::warn!("Could not make a batch slot: {e}"),
+                }
+            }
+            if let Some(slot) = batch.slots.get_mut(slot_index) {
+                let same = slot.keys.len() == batch.pending.len()
+                    && slot.keys.iter().zip(&batch.pending).all(|(k, p)| *k == p.key);
+                self.bind_vertex_array(Some(&slot.vao));
+                if !same {
+                    Self::batch_build(
+                        &batch.pending,
+                        &mut batch.scratch_vertices,
+                        &mut batch.scratch_indices,
+                    );
+                    self.gl
+                        .bind_buffer(Gl::ARRAY_BUFFER, Some(&slot.vertex_buffer.buffer));
+                    self.gl.buffer_data_with_u8_array(
+                        Gl::ARRAY_BUFFER,
+                        bytemuck::cast_slice(&batch.scratch_vertices),
+                        Gl::DYNAMIC_DRAW,
+                    );
+                    self.gl
+                        .bind_buffer(Gl::ELEMENT_ARRAY_BUFFER, Some(&slot.index_buffer.buffer));
+                    self.gl.buffer_data_with_u8_array(
+                        Gl::ELEMENT_ARRAY_BUFFER,
+                        bytemuck::cast_slice(&batch.scratch_indices),
+                        Gl::DYNAMIC_DRAW,
+                    );
+                    slot.keys.clear();
+                    slot.keys.extend(batch.pending.iter().map(|p| p.key));
+                    slot.num_indices = batch.scratch_indices.len() as i32;
+                }
+                if slot.num_indices > 0 {
+                    self.gl.draw_elements_with_i32(
+                        Gl::TRIANGLES,
+                        slot.num_indices,
+                        Gl::UNSIGNED_INT,
+                        0,
+                    );
+                }
+            } else {
+                // Past the kept slots (or none could be made): draw each piece on its own.
+                for piece in &batch.pending {
+                    let draw = &as_mesh(&piece.shape).draws[piece.draw];
+                    let k = &piece.key;
+                    let world = [
+                        [k.matrix[0], k.matrix[1], 0.0, 0.0],
+                        [k.matrix[2], k.matrix[3], 0.0, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [k.matrix[4], k.matrix[5], 0.0, 1.0],
+                    ];
+                    self.bind_vertex_array(Some(&draw.vao));
+                    program.uniform_matrix4fv(&self.gl, ShaderUniform::WorldMatrix, &world);
+                    program.uniform4fv(&self.gl, ShaderUniform::MultColor, &k.mult);
+                    program.uniform4fv(&self.gl, ShaderUniform::AddColor, &k.add);
+                    self.gl.draw_elements_with_i32(
+                        Gl::TRIANGLES,
+                        k.num_indices as i32,
+                        Gl::UNSIGNED_INT,
+                        0,
+                    );
+                }
+                self.mvs_world = None;
+                self.mult_color = None;
+                self.add_color = None;
+            }
+            batch.pending.clear();
+            batch.pending_vertices = 0;
         }
         self.batch = Some(batch);
     }
@@ -1915,6 +2016,9 @@ impl RenderBackend for WebGlRenderBackend {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
+        if let Some(batch) = &mut self.batch {
+            batch.next_slot = 0;
+        }
         if !cache_entries.is_empty() {
             // cacheAsBitmap images: drawn before the stage, so the stage buffers are not interrupted.
             // Filters are not supported by this renderer and are left out, as on the stage.
@@ -2323,7 +2427,7 @@ impl CommandHandler for WebGlRenderBackend {
         self.set_stencil_state();
 
         let mesh = as_mesh(&shape);
-        for draw in &mesh.draws {
+        for (draw_index, draw) in mesh.draws.iter().enumerate() {
             // Ignore strokes when drawing a mask stencil.
             let num_indices = if self.mask_state != MaskState::DrawMaskStencil
                 && self.mask_state != MaskState::ClearMaskStencil
@@ -2338,7 +2442,15 @@ impl CommandHandler for WebGlRenderBackend {
 
             if let (DrawType::Color, Some(cpu)) = (&draw.draw_type, &draw.cpu) {
                 if self.batch.is_some() && arglax_batching() {
-                    self.batch_append(cpu, &transform, mult_color, add_color, num_indices as usize);
+                    self.batch_append(
+                        &shape,
+                        draw_index,
+                        cpu,
+                        &transform,
+                        mult_color,
+                        add_color,
+                        num_indices as usize,
+                    );
                     continue;
                 }
             }
@@ -2672,6 +2784,8 @@ struct Draw {
 /// Arglax: a plain-colour piece's geometry as uploaded, in shape space.
 #[derive(Debug)]
 struct CpuMesh {
+    /// Never reused, unlike an address, so a batch can tell its pieces apart from frame to frame.
+    id: u64,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
 }
@@ -2680,12 +2794,42 @@ struct CpuMesh {
 /// drawn with a single call. Upstream draws each piece on its own (a vertex array bind, its world
 /// matrix and colour uniforms and a drawElements each): about 3,000 times a picture in DragonFable's
 /// towns, every call a trip from WebAssembly through JavaScript to the GPU process.
+///
+/// Each batch of a frame has a slot that keeps its GPU buffers and what it was built from (the
+/// pieces, their transforms and colour transforms). When the same batch comes up next frame with
+/// nothing changed, as most of a still scene does, its buffers are drawn again as they are: no CPU
+/// transform and no upload. Only batches with something that moved are rebuilt.
 struct ColorBatch {
+    pending: Vec<BatchPiece>,
+    pending_vertices: usize,
+    slots: Vec<BatchSlot>,
+    next_slot: usize,
+    scratch_vertices: Vec<Vertex>,
+    scratch_indices: Vec<u32>,
+}
+
+/// One piece waiting in a batch: its shape (kept alive until the batch is drawn) and how it's drawn.
+struct BatchPiece {
+    shape: ShapeHandle,
+    draw: usize,
+    key: PieceKey,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct PieceKey {
+    mesh: u64,
+    matrix: [f32; 6],
+    mult: [f32; 4],
+    add: [f32; 4],
+    num_indices: u32,
+}
+
+struct BatchSlot {
     vao: WebGlVertexArrayObject,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
-    vertices: Vec<Vertex>,
-    indices: Vec<u32>,
+    keys: Vec<PieceKey>,
+    num_indices: i32,
 }
 
 #[derive(Debug)]
