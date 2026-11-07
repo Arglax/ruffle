@@ -273,6 +273,11 @@ impl<'gc> MovieClipData<'gc> {
 }
 
 impl<'gc> MovieClip<'gc> {
+    /// MVS lag-killer experiment: a hidden clip that is already built is left as it is.
+    fn mvs_frozen(self) -> bool {
+        !self.visible() && self.0.initialized() && self.0.object2.get().is_some()
+    }
+
     pub fn downgrade(self) -> MovieClipWeak<'gc> {
         MovieClipWeak(Gc::downgrade(self.0))
     }
@@ -2530,6 +2535,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn enter_frame(self, context: &mut UpdateContext<'gc>) {
+        if crate::display_object::mvs_interp::freeze_hidden() && self.mvs_frozen() {
+            return;
+        }
         let skip_frame = self.base().should_skip_next_enter_frame();
         //Child removals from looping gotos appear to resolve in reverse order.
         for child in self.iter_render_list().rev() {
@@ -2583,6 +2591,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     /// Construct objects placed on this frame.
     fn construct_frame(self, context: &mut UpdateContext<'gc>) {
+        if crate::display_object::mvs_interp::freeze_hidden() && self.mvs_frozen() {
+            return;
+        }
         // AVM1 code expects to execute in line with timeline instructions, so
         // it's exempted from frame construction.
         if self.movie().is_action_script_3()
@@ -2647,6 +2658,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
     }
 
     fn run_frame_scripts(self, context: &mut UpdateContext<'gc>) {
+        if crate::display_object::mvs_interp::freeze_hidden() && self.mvs_frozen() {
+            return;
+        }
         self.run_local_frame_scripts(context);
 
         for child in self.iter_render_list() {
@@ -2796,7 +2810,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 
     fn on_parent_removed(self, context: &mut UpdateContext<'gc>) {
         if self.movie().is_action_script_3() {
-            context.orphan_manager.add_orphan_obj(self.into())
+            context.orphan_manager.add_removed_orphan_obj(self.into())
         }
     }
 

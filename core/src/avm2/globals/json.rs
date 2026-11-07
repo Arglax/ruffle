@@ -237,6 +237,11 @@ impl<'gc> AvmSerializer<'gc> {
             Value::Null => JsonValue::Null,
             Value::Undefined => JsonValue::Null,
             Value::Integer(i) => JsonValue::from(i),
+            // Flash writes a whole Number without a fraction ("1354390967"); serde_json would write
+            // "1354390967.0", which integer fields reading the JSON refuse.
+            Value::Number(n) if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 => {
+                JsonValue::from(n as i64)
+            }
             Value::Number(n) => JsonValue::from(n),
             Value::Bool(b) => JsonValue::from(b),
             Value::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),

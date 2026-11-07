@@ -39,6 +39,12 @@ pub struct BoundMethod<'gc> {
 }
 
 impl<'gc> BoundMethod<'gc> {
+    /// MVS: whether this is a method bound to its object (a method closure such as `this.onClick`).
+    /// Such closures are cached on their object, so they live exactly as long as it does.
+    pub fn is_bound(&self) -> bool {
+        self.bound_receiver.is_some()
+    }
+
     pub fn from_method(
         method: Method<'gc>,
         scope: ScopeChain<'gc>,

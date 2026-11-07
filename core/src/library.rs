@@ -1,4 +1,5 @@
 use crate::avm1::{PropertyMap as Avm1PropertyMap, PropertyMap};
+use crate::avm2::ClassWeak as Avm2ClassWeak;
 use crate::avm2::{Class as Avm2Class, Domain as Avm2Domain};
 use crate::backend::audio::SoundHandle;
 use crate::character::Character;
@@ -7,8 +8,9 @@ use crate::display_object::{Bitmap, Graphic, MorphShape, Text};
 use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
-use crate::tag_utils::SwfMovie;
-use gc_arena::{Collect, Mutation};
+use crate::tag_utils::{SwfMovie, SwfMovieWeak};
+use gc_arena::{Collect, Finalization, Gc, GcWeak, Mutation};
+use std::cell::UnsafeCell;
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::utils::remove_invalid_jpeg_data;
@@ -19,9 +21,12 @@ use crate::font::DefaultFont;
 use fnv::{FnvHashMap, FnvHashSet};
 use std::collections::HashMap;
 
+/// MVS: a class's library symbol. Held weakly: the entry keeps its movie only while the class is
+/// in use elsewhere (see `Library::mvs_keep`), so classes of unloaded movies (each AQW player's
+/// items load into their own domain) can be freed with their movies.
 #[derive(Clone, Collect)]
 #[collect(no_drop)]
-struct MovieSymbol<'gc>(SwfMovie<'gc>, CharacterId);
+struct MovieSymbol<'gc>(Avm2ClassWeak<'gc>, SwfMovieWeak<'gc>, CharacterId);
 
 /// The mappings between class objects and library characters defined by
 /// `SymbolClass`.
@@ -30,7 +35,8 @@ struct MovieSymbol<'gc>(SwfMovie<'gc>, CharacterId);
 pub struct Avm2ClassRegistry<'gc> {
     /// A list of AVM2 class objects and the character IDs they are expected to
     /// instantiate.
-    class_map: HashMap<Avm2Class<'gc>, MovieSymbol<'gc>>,
+    /// Keyed by the class's address.
+    class_map: HashMap<usize, MovieSymbol<'gc>>,
 }
 
 impl Default for Avm2ClassRegistry<'_> {
@@ -51,8 +57,9 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     /// A value of `None` indicates that this AVM2 class is not associated with
     /// a library symbol.
     pub fn class_symbol(&self, class_def: Avm2Class<'gc>) -> Option<(SwfMovie<'gc>, CharacterId)> {
-        match self.class_map.get(&class_def) {
-            Some(MovieSymbol(movie, symbol)) => Some((*movie, *symbol)),
+        match self.class_map.get(&(class_def.as_ptr() as usize)) {
+            // SAFETY: an entry's movie is kept while its class lives (`Library::mvs_keep`).
+            Some(MovieSymbol(_, movie, symbol)) => Some((unsafe { movie.assume_alive() }, *symbol)),
             None => None,
         }
     }
@@ -64,8 +71,8 @@ impl<'gc> Avm2ClassRegistry<'gc> {
         movie: SwfMovie<'gc>,
         symbol: CharacterId,
     ) {
-        if let Some(old) = self.class_map.get(&class_def) {
-            if SwfMovie::ptr_eq(&movie, &old.0) && symbol != old.1 {
+        if let Some(old) = self.class_map.get(&(class_def.as_ptr() as usize)) {
+            if std::ptr::eq(movie.as_ptr(), old.1.as_ptr()) && symbol != old.2 {
                 // Flash player actually allows using the same class in multiple SymbolClass
                 // entries in the same swf, with *different* symbol ids. Whichever one
                 // is processed first will *win*, and the second one will be ignored.
@@ -74,7 +81,7 @@ impl<'gc> Avm2ClassRegistry<'gc> {
                 tracing::warn!(
                     "Tried to overwrite class {:?} id={:?} with symbol id={:?} from same movie",
                     class_def,
-                    old.1,
+                    old.2,
                     symbol,
                 );
             }
@@ -85,7 +92,36 @@ impl<'gc> Avm2ClassRegistry<'gc> {
             // instantiates the clip on the timeline.
             return;
         }
-        self.class_map.insert(class_def, MovieSymbol(movie, symbol));
+        self.class_map.insert(
+            class_def.as_ptr() as usize,
+            MovieSymbol(class_def.mvs_downgrade(), movie.downgrade(), symbol),
+        );
+    }
+
+    /// MVS: keeps the movie of every class still in use (with `free` off: every class and movie).
+    /// True if that kept anything new.
+    fn mvs_keep(&self, fc: &Finalization<'gc>, free: bool) -> bool {
+        let mut kept = false;
+        for MovieSymbol(class, movie, _) in self.class_map.values() {
+            let class_dead = class.is_dead(fc);
+            if class_dead && !free {
+                class.resurrect(fc);
+                kept = true;
+            }
+            if (!class_dead || !free) && movie.is_dead(fc) {
+                movie.resurrect(fc);
+                kept = true;
+            }
+        }
+        kept
+    }
+
+    fn mvs_has_dead(&self, fc: &Finalization<'gc>) -> bool {
+        self.class_map.values().any(|MovieSymbol(class, _, _)| class.is_dead(fc))
+    }
+
+    fn mvs_drop_dead(&mut self, fc: &Finalization<'gc>) {
+        self.class_map.retain(|_, MovieSymbol(class, _, _)| !class.is_dead(fc));
     }
 }
 
@@ -373,27 +409,85 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
     }
 }
 
+/// MVS: a movie library in its own GC allocation, which `MovieLibraries` holds weakly.
+struct LibCell<'gc>(UnsafeCell<MovieLibrary<'gc>>);
+
+// SAFETY: traces the library it holds. Tracing only happens between game frames, never while a
+// reference from `LibSlot::library`/`library_mut` is alive.
+unsafe impl<'gc> Collect<'gc> for LibCell<'gc> {
+    fn trace<T: gc_arena::collect::Trace<'gc>>(&self, cc: &mut T) {
+        unsafe { &*self.0.get() }.trace(cc)
+    }
+}
+
+/// MVS: one movie's library.
 #[derive(Collect)]
 #[collect(no_drop)]
-struct MovieLibraries<'gc>(HashMap<SwfMovie<'gc>, MovieLibrary<'gc>>);
+enum LibSlot<'gc> {
+    /// Made since the last collection step: owned here until `Library::mvs_prepare` moves it into
+    /// its own allocation.
+    Fresh(Box<MovieLibrary<'gc>>),
+    /// Kept only while its movie is in use elsewhere (see `Library::mvs_keep`). The cell is reached
+    /// only through this weak handle, so the collector leaves it unmarked until finalization; then
+    /// `Player::mvs_collect` marks what it keeps without letting the game run in between, and the
+    /// cycle goes straight on to the sweep. A cell is therefore never marked while the game can
+    /// change it during marking, and needs no write barrier.
+    Held {
+        movie: SwfMovieWeak<'gc>,
+        cell: GcWeak<'gc, LibCell<'gc>>,
+    },
+}
+
+impl<'gc> LibSlot<'gc> {
+    fn library(&self) -> &MovieLibrary<'gc> {
+        match self {
+            LibSlot::Fresh(library) => library,
+            // SAFETY: a held cell lives while its entry does (dead entries are removed before the
+            // sweep that frees them), and no `&mut` to it can be alive alongside `&self`.
+            LibSlot::Held { cell, .. } => unsafe { &*(*cell.as_ptr()).0.get() },
+        }
+    }
+
+    fn library_mut(&mut self) -> &mut MovieLibrary<'gc> {
+        match self {
+            LibSlot::Fresh(library) => library,
+            // SAFETY: as above; `&mut self` makes this the only reference.
+            LibSlot::Held { cell, .. } => unsafe { &mut *(*cell.as_ptr()).0.get() },
+        }
+    }
+}
+
+/// The libraries of all movies, keyed by the movie's address.
+///
+/// MVS: upstream keeps every library (and so every movie loaded since start) forever. AQW loads each
+/// player's gear, pet and effects as separate movies, so a busy room filled the 4 GB WebAssembly
+/// memory in minutes. Libraries are now freed once nothing else uses their movie.
+#[derive(Collect)]
+#[collect(no_drop)]
+struct MovieLibraries<'gc> {
+    slots: HashMap<usize, LibSlot<'gc>>,
+}
 
 impl<'gc> MovieLibraries<'gc> {
     fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            slots: HashMap::new(),
+        }
     }
 
     fn get(&self, key: SwfMovie<'gc>) -> Option<&MovieLibrary<'gc>> {
-        self.0.get(&key)
+        self.slots.get(&(key.as_ptr() as usize)).map(LibSlot::library)
     }
 
     fn get_or_insert_mut(&mut self, movie: SwfMovie<'gc>) -> &mut MovieLibrary<'gc> {
-        self.0
-            .entry(movie)
-            .or_insert_with(|| MovieLibrary::new(movie))
+        self.slots
+            .entry(movie.as_ptr() as usize)
+            .or_insert_with(|| LibSlot::Fresh(Box::new(MovieLibrary::new(movie))))
+            .library_mut()
     }
 
     fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
-        self.0.keys().copied()
+        self.slots.values().map(|slot| slot.library().swf)
     }
 }
 
@@ -428,6 +522,9 @@ pub struct Library<'gc> {
     /// A list of the symbols associated with specific AVM2 constructor
     /// prototypes.
     avm2_class_registry: Avm2ClassRegistry<'gc>,
+
+    /// MVS: every `new Dictionary(true)` still alive (see `mvs_keep`).
+    mvs_weak_dicts: Vec<crate::avm2::object::WeakObject<'gc>>,
 }
 
 impl<'gc> Library<'gc> {
@@ -441,6 +538,95 @@ impl<'gc> Library<'gc> {
             default_font_names: Default::default(),
             default_font_cache: Default::default(),
             avm2_class_registry: Default::default(),
+            mvs_weak_dicts: Vec::new(),
+        }
+    }
+
+    /// MVS: a dictionary created with weak keys.
+    pub fn mvs_register_weak_dict(&mut self, dict: crate::avm2::Object<'gc>) {
+        self.mvs_weak_dicts.push(dict.downgrade());
+    }
+
+    // MVS: whether the GC value at `ptr` is unreachable so far this cycle (during finalization).
+    fn mvs_ptr_dead(fc: &Finalization<'gc>, ptr: *const ()) -> bool {
+        // SAFETY: `ptr` is a GC value the caller holds a (weak or strong) reference to.
+        unsafe { GcWeak::<()>::from_ptr(ptr) }.is_dead(fc)
+    }
+
+    // MVS: keeps the values of weak-keyed dictionary entries whose key is in use elsewhere.
+    fn mvs_keep_dict_values(&self, fc: &Finalization<'gc>) -> bool {
+        use crate::avm2::object::TObject as _;
+        let mut kept = false;
+        for weak in &self.mvs_weak_dicts {
+            if Self::mvs_ptr_dead(fc, weak.as_ptr() as *const ()) {
+                continue;
+            }
+            let Some(dict) = weak.upgrade(fc) else {
+                continue;
+            };
+            let base = dict.base();
+            let values = base.values();
+            for (key, prop) in values.iter() {
+                let crate::avm2::dynamic_map::DynamicKey::Object(o) = key else {
+                    continue;
+                };
+                if Self::mvs_ptr_dead(fc, o.as_ptr() as *const ()) {
+                    continue;
+                }
+                for ptr in gc_arena::mvs::root_edges(&prop.value) {
+                    // SAFETY: a pointer held by a live entry's value.
+                    let gc = unsafe { Gc::<()>::from_ptr(ptr) };
+                    if Gc::is_dead(fc, gc) {
+                        Gc::resurrect(fc, gc);
+                        kept = true;
+                    }
+                }
+            }
+        }
+        kept
+    }
+
+    fn mvs_dicts_have_dead(&self, fc: &Finalization<'gc>) -> bool {
+        use crate::avm2::object::TObject as _;
+        self.mvs_weak_dicts.iter().any(|weak| {
+            if Self::mvs_ptr_dead(fc, weak.as_ptr() as *const ()) {
+                return true;
+            }
+            weak.upgrade(fc).is_some_and(|dict| {
+                dict.base().values().iter().any(|(key, _)| {
+                    matches!(key, crate::avm2::dynamic_map::DynamicKey::Object(o)
+                        if Self::mvs_ptr_dead(fc, o.as_ptr() as *const ()))
+                })
+            })
+        })
+    }
+
+    fn mvs_drop_dead_dict_entries(&mut self, fc: &Finalization<'gc>) {
+        use crate::avm2::object::TObject as _;
+        self.mvs_weak_dicts.retain(|weak| !Self::mvs_ptr_dead(fc, weak.as_ptr() as *const ()));
+        for weak in &self.mvs_weak_dicts {
+            let Some(dict) = weak.upgrade(fc) else {
+                continue;
+            };
+            let base = dict.base();
+            let dead: Vec<_> = base
+                .values()
+                .iter()
+                .filter_map(|(key, _)| match key {
+                    crate::avm2::dynamic_map::DynamicKey::Object(o)
+                        if Self::mvs_ptr_dead(fc, o.as_ptr() as *const ()) =>
+                    {
+                        Some(*key)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !dead.is_empty() {
+                let mut values = base.values_mut(fc);
+                for key in dead {
+                    values.remove(&key);
+                }
+            }
         }
     }
 
@@ -454,6 +640,93 @@ impl<'gc> Library<'gc> {
 
     pub fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
         self.movie_libraries.known_movies()
+    }
+
+    /// MVS: how many movie libraries are kept, and the movies' uncompressed size in bytes.
+    pub fn mvs_stats(&self) -> (usize, usize) {
+        self.known_movies().fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.data().len()))
+    }
+
+    /// MVS: whether `mvs_prepare` has anything to do. The root movie's library stays owned here
+    /// (it is never freed, and is the biggest).
+    pub fn mvs_needs_prepare(&self, root: SwfMovie<'gc>) -> bool {
+        let root = root.as_ptr() as usize;
+        self.movie_libraries
+            .slots
+            .iter()
+            .any(|(key, slot)| *key != root && matches!(slot, LibSlot::Fresh(_)))
+    }
+
+    /// MVS: run at the start of each collection step: libraries made since the last step (other
+    /// than the root movie's) move into their own allocations, held weakly from then on.
+    pub fn mvs_prepare(&mut self, mc: &Mutation<'gc>, root: SwfMovie<'gc>) {
+        let root = root.as_ptr() as usize;
+        let keys: Vec<usize> = self
+            .movie_libraries
+            .slots
+            .iter()
+            .filter(|(key, slot)| **key != root && matches!(slot, LibSlot::Fresh(_)))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            let Some(LibSlot::Fresh(library)) = self.movie_libraries.slots.remove(&key) else {
+                continue;
+            };
+            let movie = library.swf.downgrade();
+            let cell = Gc::new(mc, LibCell(UnsafeCell::new(*library)));
+            self.movie_libraries.slots.insert(
+                key,
+                LibSlot::Held {
+                    movie,
+                    cell: Gc::downgrade(cell),
+                },
+            );
+        }
+    }
+
+    /// MVS: called on the fully marked arena (see `Player::mvs_collect`). Keeps the library of every
+    /// movie still in use elsewhere, and the movie of every class still in use (with `free` off:
+    /// everything, like upstream). Returns true if that kept anything new: the arena must then be
+    /// marked again and this called again. Once nothing new is kept, `mvs_drop_dead` removes the
+    /// rest.
+    pub fn mvs_keep(&self, fc: &Finalization<'gc>, free: bool) -> bool {
+        let mut kept = self.avm2_class_registry.mvs_keep(fc, free);
+        kept |= self.mvs_keep_dict_values(fc);
+        for slot in self.movie_libraries.slots.values() {
+            if let LibSlot::Held { movie, cell } = slot {
+                let movie_dead = movie.is_dead(fc);
+                if movie_dead && !free {
+                    movie.resurrect(fc);
+                    kept = true;
+                }
+                if (!movie_dead || !free) && cell.is_dead(fc) {
+                    let _ = cell.resurrect(fc);
+                    kept = true;
+                }
+            }
+        }
+        kept
+    }
+
+    /// MVS: whether `mvs_drop_dead` has anything to remove.
+    pub fn mvs_has_dead(&self, fc: &Finalization<'gc>) -> bool {
+        self.avm2_class_registry.mvs_has_dead(fc)
+            || self.mvs_dicts_have_dead(fc)
+            || self.movie_libraries.slots.values().any(|slot| match slot {
+                LibSlot::Held { movie, .. } => movie.is_dead(fc),
+                LibSlot::Fresh(_) => false,
+            })
+    }
+
+    /// MVS: forgets libraries and class symbols whose movie or class is no longer used; the sweep
+    /// that follows frees them.
+    pub fn mvs_drop_dead(&mut self, fc: &Finalization<'gc>) {
+        self.avm2_class_registry.mvs_drop_dead(fc);
+        self.mvs_drop_dead_dict_entries(fc);
+        self.movie_libraries.slots.retain(|_, slot| match slot {
+            LibSlot::Held { movie, .. } => !movie.is_dead(fc),
+            LibSlot::Fresh(_) => true,
+        });
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)

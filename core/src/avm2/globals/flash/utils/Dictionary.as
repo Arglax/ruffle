@@ -10,8 +10,11 @@ package flash.utils {
 
         public function Dictionary(weakKeys:Boolean = false) {
             if (weakKeys) {
-                stub_constructor("flash.utils.Dictionary", "with weak keys");
+                this.mvsWeakKeys();
             }
         }
+
+        // MVS: weak keys (see dynamic_map.rs and Library::mvs_keep).
+        private native function mvsWeakKeys():void;
     }
 }

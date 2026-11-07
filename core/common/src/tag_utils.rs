@@ -1,6 +1,6 @@
 use crate::sandbox::SandboxType;
 
-use gc_arena::{Collect, Gc, GcWeak, Mutation};
+use gc_arena::{Collect, Finalization, Gc, GcWeak, Mutation};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
@@ -63,6 +63,29 @@ pub struct SwfMovieWeak<'gc>(GcWeak<'gc, SwfMovieData>);
 impl<'gc> SwfMovieWeak<'gc> {
     pub fn upgrade(&self, mc: &Mutation<'gc>) -> Option<SwfMovie<'gc>> {
         self.0.upgrade(mc).map(SwfMovie)
+    }
+
+    /// MVS: whether nothing but weak handles reaches this movie (during finalization).
+    pub fn is_dead(self, fc: &Finalization<'gc>) -> bool {
+        self.0.is_dead(fc)
+    }
+
+    /// MVS: keeps the movie for this collection cycle.
+    pub fn resurrect(self, fc: &Finalization<'gc>) {
+        let _ = self.0.resurrect(fc);
+    }
+
+    pub fn as_ptr(self) -> *const SwfMovieData {
+        self.0.as_ptr()
+    }
+
+    /// MVS: the movie itself, for a handle whose movie is known to be kept alive (see
+    /// `Library::mvs_finalize` in ruffle_core).
+    ///
+    /// # Safety
+    /// The movie must not have been collected.
+    pub unsafe fn assume_alive(self) -> SwfMovie<'gc> {
+        SwfMovie(unsafe { Gc::from_ptr(self.0.as_ptr()) })
     }
 }
 

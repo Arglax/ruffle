@@ -517,6 +517,8 @@ pub trait TDisplayObjectContainer<'gc>:
     /// Renders the children of this container in render list order.
     #[no_dynamic]
     fn render_children(self, context: &mut RenderContext<'_, 'gc>) {
+        use crate::display_object::mvs_cull;
+        let cull = !context.is_offscreen && mvs_cull::active();
         let mut clip_depth = 0;
         let mut clip_depth_stack: Vec<(Depth, DisplayObject<'_>)> = vec![];
         for child in self.iter_render_list() {
@@ -531,6 +533,9 @@ pub trait TDisplayObjectContainer<'gc>:
                 // Clear the mask stencil and pop the mask.
                 let (prev_clip_depth, clip_child) = clip_depth_stack.pop().unwrap();
                 clip_depth = prev_clip_depth;
+                if cull {
+                    mvs_cull::pop();
+                }
                 context.commands.deactivate_mask();
                 clip_child.render(context);
                 context.commands.pop_mask();
@@ -542,6 +547,10 @@ pub trait TDisplayObjectContainer<'gc>:
                 context.commands.push_mask();
                 child.render(context);
                 context.commands.activate_mask();
+                if cull {
+                    let matrix = context.transform_stack.transform().matrix * child.base().render_matrix();
+                    mvs_cull::push(child.render_bounds_with_transform(&matrix, false, &context.stage.view_matrix()));
+                }
             } else if child.visible() || context.commands.drawing_mask() {
                 // Either a normal visible child, or a descendant of a mask object
                 // that we're drawing. The 'visible' flag is ignored for all descendants
@@ -552,6 +561,9 @@ pub trait TDisplayObjectContainer<'gc>:
 
         // Pop any remaining masks.
         for (_, clip_child) in clip_depth_stack.into_iter().rev() {
+            if cull {
+                mvs_cull::pop();
+            }
             context.commands.deactivate_mask();
             clip_child.render(context);
             context.commands.pop_mask();

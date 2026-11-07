@@ -124,6 +124,11 @@ impl BitmapCache {
     }
 
     fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
+        // MVS: an in-between picture reuses the bitmap unless the game changed its contents
+        // (make_dirty); a size or scale off by a fraction for 1/60 s is not visible.
+        if mvs_interp::in_between() && !self.matrix_a.is_nan() && self.bitmap.is_some() {
+            return false;
+        }
         self.matrix_a != other.a
             || self.matrix_b != other.b
             || self.matrix_c != other.c
@@ -259,6 +264,12 @@ pub enum RenderMask<'gc> {
 #[repr(align(8))]
 pub struct DisplayObjectBase<'gc> {
     cell: RefCell<DisplayObjectBaseMut>,
+
+    /// MVS in-betweening: the matrix before this object's first change in frame `prev_frame`, and
+    /// the frame it joined a display list (it is drawn as is in that frame).
+    prev_matrix: Cell<Matrix>,
+    prev_frame: Cell<u32>,
+    born_frame: Cell<u32>,
     parent: Lock<Option<DisplayObject<'gc>>>,
     place_frame: Cell<u16>,
     depth: Cell<Depth>,
@@ -329,6 +340,9 @@ struct DisplayObjectBaseMut {
     /// If this Display Object should cacheAsBitmap - and if so, the cache itself.
     /// None means not cached, Some means cached.
     cache: Option<BitmapCache>,
+
+    /// MVS: cached as a bitmap because a child needs the pixels behind it for its blend mode.
+    blend_cache: bool,
 }
 
 impl Default for DisplayObjectBase<'_> {
@@ -338,7 +352,11 @@ impl Default for DisplayObjectBase<'_> {
                 filters: Default::default(),
                 blend_shader: None,
                 cache: None,
+                blend_cache: false,
             }),
+            prev_matrix: Default::default(),
+            prev_frame: Cell::new(0),
+            born_frame: Cell::new(mvs_interp::frame()),
             parent: Default::default(),
             place_frame: Default::default(),
             depth: Default::default(),
@@ -417,8 +435,45 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.matrix.get()
     }
 
-    pub fn set_matrix(&self, matrix: Matrix) {
+    /// MVS: sets the matrix, keeping the one it had at the start of this frame for in-betweening.
+    fn store_matrix(&self, matrix: Matrix) {
+        let frame = mvs_interp::frame();
+        if self.prev_frame.get() != frame {
+            self.prev_frame.set(frame);
+            self.prev_matrix.set(self.matrix.get());
+        }
         self.matrix.set(matrix);
+    }
+
+    /// MVS: the matrix to draw with. While in-betweening is on, an object that moved in the latest
+    /// game frame is drawn part of the way from where it was to where it is now; big jumps, flips
+    /// and objects that just appeared are drawn where they are.
+    fn render_matrix(&self) -> Matrix {
+        let matrix = self.matrix.get();
+        let Some(t) = mvs_interp::alpha() else {
+            return matrix;
+        };
+        let frame = mvs_interp::frame();
+        if self.prev_frame.get() != frame || self.born_frame.get() >= frame || t >= 1.0 {
+            return matrix;
+        }
+        let prev = self.prev_matrix.get();
+        if prev == matrix || !mvs_interp::can_blend(&prev, &matrix) {
+            return matrix;
+        }
+        mvs_interp::lerp(&prev, &matrix, t)
+    }
+
+    fn render_transform(&self, apply_matrix: bool) -> Transform {
+        let mut transform = self.transform(false);
+        if apply_matrix {
+            transform.matrix = self.render_matrix();
+        }
+        transform
+    }
+
+    pub fn set_matrix(&self, matrix: Matrix) {
+        self.store_matrix(matrix);
         self.set_scale_rotation_cached(false);
     }
 
@@ -450,7 +505,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.tx != x;
         matrix.tx = x;
-        self.matrix.set(matrix);
+        self.store_matrix(matrix);
         self.set_transformed_by_script(true);
         changed
     }
@@ -463,7 +518,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         let changed = matrix.ty != y;
         matrix.ty = y;
-        self.matrix.set(matrix);
+        self.store_matrix(matrix);
         self.set_transformed_by_script(true);
         changed
     }
@@ -551,7 +606,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         matrix.b = (scale_x * sin_x) as f32;
         matrix.c = (scale_y * -sin_y) as f32;
         matrix.d = (scale_y * cos_y) as f32;
-        self.matrix.set(matrix);
+        self.store_matrix(matrix);
 
         changed
     }
@@ -586,7 +641,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.a = (cos * value.unit()) as f32;
         matrix.b = (sin * value.unit()) as f32;
-        self.matrix.set(matrix);
+        self.store_matrix(matrix);
 
         changed
     }
@@ -622,7 +677,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         let mut matrix = self.matrix.get();
         matrix.c = (-sin * value.unit()) as f32;
         matrix.d = (cos * value.unit()) as f32;
-        self.matrix.set(matrix);
+        self.store_matrix(matrix);
 
         changed
     }
@@ -679,6 +734,7 @@ impl<'gc> DisplayObjectBase<'gc> {
     /// You should almost always use `DisplayObject.set_parent` instead, which
     /// properly handles 'orphan' movie clips
     fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
+        this.born_frame.set(mvs_interp::frame());
         unlock!(this, Self, parent).set(parent)
     }
 
@@ -838,6 +894,20 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.recheck_cache_as_bitmap();
     }
 
+    /// MVS: caches this object as a bitmap while one of its children uses a blend mode that needs the
+    /// pixels behind it, so the renderer mixes it inside that small image (see `render_base`).
+    fn set_blend_cache(&self, wanted: bool) {
+        let changed = {
+            let mut write = self.cell.borrow_mut();
+            let changed = write.blend_cache != wanted;
+            write.blend_cache = wanted;
+            changed
+        };
+        if changed {
+            self.recheck_cache_as_bitmap();
+        }
+    }
+
     fn bitmap_cache_mut(&self) -> RefMut<'_, Option<BitmapCache>> {
         RefMut::map(self.cell.borrow_mut(), |c| &mut c.cache)
     }
@@ -864,7 +934,9 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn recheck_cache_as_bitmap(&self) {
         let mut write = self.cell.borrow_mut();
-        let should_cache = self.is_bitmap_cached_preference() || !write.filters.is_empty();
+        // MVS: the WebGL renderer cannot draw filters, so a filter alone does not make the object a
+        // cached bitmap (that would only cost a redraw per change); cacheAsBitmap still does.
+        let should_cache = self.is_bitmap_cached_preference() || write.blend_cache;
         if should_cache {
             write.cache.get_or_insert_default();
         } else {
@@ -965,6 +1037,202 @@ struct DrawCacheInfo {
     filters: Vec<Filter>,
 }
 
+/// MVS motion in-betweening. The game runs its frames at its own rate (AQW: 30 a second); the
+/// player can draw more often than that, and each extra drawing shows moving objects between where
+/// they were in the previous game frame and where they are now (`alpha` = how far into the current
+/// frame interval this drawing is). Only positions, sizes and rotations are in-betweened; art that
+/// changes from one frame to the next still changes 30 times a second.
+pub mod mvs_interp {
+    use ruffle_render::matrix::Matrix;
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    use swf::Twips;
+
+    static FRAME: AtomicU32 = AtomicU32::new(1);
+    /// f32 bits of the current alpha, or u32::MAX when in-betweening is off.
+    static ALPHA: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    pub fn frame() -> u32 {
+        FRAME.load(Relaxed)
+    }
+
+    /// Called at the start of each game frame.
+    pub fn next_frame() {
+        FRAME.fetch_add(1, Relaxed);
+    }
+
+    pub fn set_alpha(alpha: Option<f32>) {
+        ALPHA.store(alpha.map_or(u32::MAX, |a| a.clamp(0.0, 1.0).to_bits()), Relaxed);
+    }
+
+    pub fn alpha() -> Option<f32> {
+        let bits = ALPHA.load(Relaxed);
+        (bits != u32::MAX).then(|| f32::from_bits(bits))
+    }
+
+    /// Lag-killer experiments (off unless the page turns them on): skip the timelines of hidden
+    /// clips, and of orphans (clips removed from the stage that Flash still runs).
+    static FREEZE_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static FREEZE_ORPHANS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_freeze(hidden: bool, orphans: bool) {
+        FREEZE_HIDDEN.store(hidden, Relaxed);
+        FREEZE_ORPHANS.store(orphans, Relaxed);
+    }
+
+    pub fn freeze_hidden() -> bool {
+        FREEZE_HIDDEN.load(Relaxed)
+    }
+
+    pub fn freeze_orphans() -> bool {
+        FREEZE_ORPHANS.load(Relaxed)
+    }
+
+    /// Whether movie libraries are freed once their movies are unused (see `Library::mvs_finalize`).
+    /// On unless the page sets window.__mvsKeepLibraries.
+    static FREE_LIBRARIES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub fn set_free_libraries(on: bool) {
+        FREE_LIBRARIES.store(on, Relaxed);
+    }
+
+    pub fn free_libraries() -> bool {
+        FREE_LIBRARIES.load(Relaxed)
+    }
+
+    /// Whether a game frame ran since the last picture (set for each picture while in-betweening).
+    static FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    pub fn set_fresh(fresh: bool) {
+        FRESH.store(fresh, Relaxed);
+    }
+
+    /// A picture drawn between game frames: the objects are the same as in the last one, only moved.
+    /// Work that only follows changes (bitmap caches, the blend-cache check) can be skipped for it.
+    pub fn in_between() -> bool {
+        alpha().is_some() && !FRESH.load(Relaxed)
+    }
+
+    /// Jumps (more than 120 px in one frame), mirror flips and big turns or size changes are
+    /// shown as they are: blending them would draw a squashed or sliding in-between.
+    pub fn can_blend(a: &Matrix, b: &Matrix) -> bool {
+        const MAX_MOVE: i32 = 120 * 20;
+        let flip = |x: f32, y: f32| (x > 0.001 && y < -0.001) || (x < -0.001 && y > 0.001);
+        (b.tx.get() - a.tx.get()).abs() <= MAX_MOVE
+            && (b.ty.get() - a.ty.get()).abs() <= MAX_MOVE
+            && !flip(a.a, b.a)
+            && !flip(a.d, b.d)
+            && (b.a - a.a).abs() + (b.b - a.b).abs() + (b.c - a.c).abs() + (b.d - a.d).abs() <= 0.6
+    }
+
+    pub fn lerp(a: &Matrix, b: &Matrix, t: f32) -> Matrix {
+        let f = |x: f32, y: f32| x + (y - x) * t;
+        let tw = |x: Twips, y: Twips| {
+            Twips::new((x.get() as f32 + (y.get() - x.get()) as f32 * t).round() as i32)
+        };
+        Matrix {
+            a: f(a.a, b.a),
+            b: f(a.b, b.b),
+            c: f(a.c, b.c),
+            d: f(a.d, b.d),
+            tx: tw(a.tx, b.tx),
+            ty: tw(a.ty, b.ty),
+        }
+    }
+}
+
+/// MVS culling: shapes, text and bitmaps whose box lies wholly outside what can be seen (the screen,
+/// and the masks and scroll rects they are drawn under) are not drawn. Ruffle otherwise draws every
+/// one of them; a scrolled list such as the badge book sent over 5,000 draw calls a picture.
+/// Rectangles are in the main picture's pixel space (twips); bitmap caches and BitmapData.draw
+/// (offscreen pictures) are not culled.
+pub mod mvs_cull {
+    use std::cell::RefCell;
+    use swf::{Rectangle, Twips};
+
+    thread_local! {
+        static RECTS: RefCell<Vec<Rectangle<Twips>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Narrows what can be seen to `rect` (an empty or invalid mask box narrows nothing).
+    pub fn push(rect: Rectangle<Twips>) {
+        RECTS.with(|r| {
+            let mut r = r.borrow_mut();
+            let next = match (r.last(), rect.is_valid()) {
+                (Some(top), true) => Rectangle {
+                    x_min: top.x_min.max(rect.x_min),
+                    y_min: top.y_min.max(rect.y_min),
+                    x_max: top.x_max.min(rect.x_max),
+                    y_max: top.y_max.min(rect.y_max),
+                },
+                (Some(top), false) => *top,
+                (None, _) => rect,
+            };
+            r.push(next);
+        });
+    }
+
+    pub fn pop() {
+        RECTS.with(|r| {
+            r.borrow_mut().pop();
+        });
+    }
+
+    pub fn clear() {
+        RECTS.with(|r| r.borrow_mut().clear());
+    }
+
+    pub fn active() -> bool {
+        RECTS.with(|r| !r.borrow().is_empty())
+    }
+
+    pub fn visible(bounds: &Rectangle<Twips>) -> bool {
+        if !bounds.is_valid() {
+            return true;
+        }
+        RECTS.with(|r| match r.borrow().last() {
+            Some(top) => {
+                top.x_min <= bounds.x_max
+                    && top.x_max >= bounds.x_min
+                    && top.y_min <= bounds.y_max
+                    && top.y_max >= bounds.y_min
+            }
+            None => true,
+        })
+    }
+}
+
+/// Blend modes the WebGL renderer can only draw inside an offscreen image (they need the pixels behind).
+fn needs_backdrop(mode: ExtendedBlendMode) -> bool {
+    matches!(
+        mode,
+        ExtendedBlendMode::Darken
+            | ExtendedBlendMode::Difference
+            | ExtendedBlendMode::Invert
+            | ExtendedBlendMode::Overlay
+            | ExtendedBlendMode::HardLight
+    )
+}
+
+/// Largest object (in stage pixels) cached for its children's blend modes; anything bigger draws them
+/// as Normal, since redrawing a big image each change costs more than it is worth.
+const MAX_BLEND_CACHE_AREA: f64 = 1024.0 * 1024.0;
+
+fn update_blend_cache<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_, 'gc>) {
+    let mut wanted = match this.as_container() {
+        Some(container) => container
+            .iter_render_list()
+            .any(|child| child.visible() && needs_backdrop(child.blend_mode())),
+        None => false,
+    };
+    if wanted {
+        let matrix = context.transform_stack.transform().matrix;
+        let bounds = this.render_bounds_with_transform(&matrix, false, &context.stage.view_matrix());
+        let area = bounds.width().to_pixels() * bounds.height().to_pixels();
+        wanted = area > 0.0 && area <= MAX_BLEND_CACHE_AREA;
+    }
+    this.base().set_blend_cache(wanted);
+}
+
 pub fn render_base<'gc>(
     this: DisplayObject<'gc>,
     context: &mut RenderContext<'_, 'gc>,
@@ -976,8 +1244,23 @@ pub fn render_base<'gc>(
     }
 
     if options.apply_transform {
-        let transform = this.base().transform(options.apply_matrix);
+        let transform = if context.is_offscreen {
+            this.base().transform(options.apply_matrix)
+        } else {
+            this.base().render_transform(options.apply_matrix)
+        };
         context.transform_stack.push(&transform);
+    }
+
+    if !context.is_offscreen && this.as_container().is_none() && mvs_cull::active() {
+        let matrix = context.transform_stack.transform().matrix;
+        let bounds = this.render_bounds_with_transform(&matrix, true, &context.stage.view_matrix());
+        if !mvs_cull::visible(&bounds) {
+            if options.apply_transform {
+                context.transform_stack.pop();
+            }
+            return;
+        }
     }
 
     let blend_mode = this.blend_mode();
@@ -986,6 +1269,15 @@ pub fn render_base<'gc>(
     } else {
         None
     };
+
+    // In-between pictures (MVS in-betweening) show the same objects as the last game frame: skip the check.
+    if context.use_bitmap_cache
+        && !context.is_offscreen
+        && !mvs_interp::in_between()
+        && context.renderer.is_offscreen_supported()
+    {
+        update_blend_cache(this, context);
+    }
 
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
         let mut cache_info: Option<DrawCacheInfo> = None;
@@ -1212,6 +1504,17 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
         None
     };
 
+    // MVS culling: the crop box of the scroll rect, in picture space.
+    let scroll_cull = this.scroll_rect().map(|rect| {
+        context.transform_stack.transform().matrix
+            * Rectangle {
+                x_min: Twips::ZERO,
+                y_min: Twips::ZERO,
+                x_max: rect.width(),
+                y_max: rect.height(),
+            }
+    });
+
     if let Some(rect) = this.scroll_rect() {
         // Translate everything that we render (including DisplayObject.mask)
         context.transform_stack.push(&Transform {
@@ -1230,10 +1533,16 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
         }
         mask_transform.matrix *= m.local_to_global_matrix();
     }
+    let mut culls = 0;
     if let RenderMask::Stencil(m) = mask {
         context.commands.push_mask();
         context.transform_stack.push(&mask_transform);
         m.render_self(context);
+        if !context.is_offscreen && mvs_cull::active() {
+            let matrix = context.transform_stack.transform().matrix;
+            mvs_cull::push(m.render_bounds_with_transform(&matrix, false, &context.stage.view_matrix()));
+            culls += 1;
+        }
         context.transform_stack.pop();
         context.commands.activate_mask();
     }
@@ -1254,6 +1563,12 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
         // The color doesn't matter, as this is a mask.
         context.commands.draw_rect(Color::WHITE, rect_mat);
         context.commands.activate_mask();
+        if !context.is_offscreen && mvs_cull::active() {
+            if let Some(bounds) = scroll_cull {
+                mvs_cull::push(bounds);
+                culls += 1;
+            }
+        }
     }
 
     if let RenderMask::Alpha(m) = mask {
@@ -1300,6 +1615,9 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
     if scroll_rect_matrix.is_some() {
         // Remove the translation that we pushed
         context.transform_stack.pop();
+    }
+    for _ in 0..culls {
+        mvs_cull::pop();
     }
 }
 

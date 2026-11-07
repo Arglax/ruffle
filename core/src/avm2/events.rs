@@ -4,11 +4,11 @@ use crate::avm2::Avm2;
 use crate::avm2::activation::Activation;
 use crate::avm2::function::FunctionArgs;
 use crate::avm2::globals::slots::flash_events_event_dispatcher as slots;
-use crate::avm2::object::{EventObject, FunctionObject, Object, TObject as _};
+use crate::avm2::object::{EventObject, FunctionObject, FunctionObjectWeak, Object, TObject as _};
 use crate::display_object::TDisplayObject;
 use crate::string::AvmString;
 use fnv::FnvHashMap;
-use gc_arena::Collect;
+use gc_arena::{Collect, Gc, GcWeak, Mutation};
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
@@ -220,8 +220,21 @@ impl<'gc> DispatchList<'gc> {
         priority: i32,
         handler: FunctionObject<'gc>,
         use_capture: bool,
+        use_weak_reference: bool,
     ) {
-        let new_handler = EventHandler::new(handler, use_capture);
+        // MVS: `useWeakReference` is honoured for methods bound to their object (`this.onClick`):
+        // the list then doesn't keep that object alive, as in Flash. AQW registers these on the
+        // stage and other long-lived objects (drop windows, item lists, chat, the camera) and
+        // relies on Flash to let them go. Other functions stay strongly held, so a one-off
+        // anonymous handler can't be collected before it runs.
+        let new_handler = if use_weak_reference && handler.executable().is_bound() {
+            EventHandler {
+                handler: HandlerRef::Weak(FunctionObjectWeak(Gc::downgrade(handler.0))),
+                use_capture,
+            }
+        } else {
+            EventHandler::new(handler, use_capture)
+        };
 
         if let Some(event_sheaf) = self.get_event(event) {
             for other_set in event_sheaf.values() {
@@ -277,15 +290,21 @@ impl<'gc> DispatchList<'gc> {
     /// phases.
     pub fn iter_event_handlers<'a>(
         &'a mut self,
+        mc: &'a Mutation<'gc>,
         event: AvmString<'gc>,
         use_capture: bool,
     ) -> impl 'a + Iterator<Item = FunctionObject<'gc>> {
-        self.get_event_mut(event)
+        // MVS: forget weak handlers whose object is gone.
+        let sheaf = self.get_event_mut(event);
+        for set in sheaf.values_mut() {
+            set.retain(|eh| eh.handler.upgrade(mc).is_some());
+        }
+        sheaf
             .iter()
             .rev()
             .flat_map(|(_p, v)| v.iter())
             .filter(move |eh| eh.use_capture == use_capture)
-            .map(|eh| eh.handler)
+            .filter_map(move |eh| eh.handler.upgrade(mc))
     }
 }
 
@@ -300,7 +319,7 @@ impl Default for DispatchList<'_> {
 #[collect(no_drop)]
 struct EventHandler<'gc> {
     /// The event handler to call.
-    handler: FunctionObject<'gc>,
+    handler: HandlerRef<'gc>,
 
     /// Indicates if this handler should only be called for capturing events
     /// (when `true`), or if it should only be called for bubbling and
@@ -311,8 +330,32 @@ struct EventHandler<'gc> {
 impl<'gc> EventHandler<'gc> {
     fn new(handler: FunctionObject<'gc>, use_capture: bool) -> Self {
         Self {
-            handler,
+            handler: HandlerRef::Strong(handler),
             use_capture,
+        }
+    }
+}
+
+/// MVS: an event handler, held strongly or (for `useWeakReference` on a bound method) weakly.
+#[derive(Clone, Copy, Collect)]
+#[collect(no_drop)]
+enum HandlerRef<'gc> {
+    Strong(FunctionObject<'gc>),
+    Weak(FunctionObjectWeak<'gc>),
+}
+
+impl<'gc> HandlerRef<'gc> {
+    fn upgrade(self, mc: &Mutation<'gc>) -> Option<FunctionObject<'gc>> {
+        match self {
+            HandlerRef::Strong(f) => Some(f),
+            HandlerRef::Weak(w) => w.0.upgrade(mc).map(FunctionObject),
+        }
+    }
+
+    fn ptr(self) -> *const () {
+        match self {
+            HandlerRef::Strong(f) => Gc::as_ptr(f.0).cast(),
+            HandlerRef::Weak(w) => GcWeak::as_ptr(w.0).cast(),
         }
     }
 }
@@ -320,7 +363,7 @@ impl<'gc> EventHandler<'gc> {
 impl PartialEq for EventHandler<'_> {
     fn eq(&self, rhs: &Self) -> bool {
         self.use_capture == rhs.use_capture
-            && std::ptr::eq(self.handler.as_ptr(), rhs.handler.as_ptr())
+            && std::ptr::eq(self.handler.ptr(), rhs.handler.ptr())
     }
 }
 
@@ -329,7 +372,7 @@ impl Eq for EventHandler<'_> {}
 impl Hash for EventHandler<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.use_capture.hash(state);
-        self.handler.as_ptr().hash(state);
+        self.handler.ptr().hash(state);
     }
 }
 
@@ -386,7 +429,7 @@ fn dispatch_event_to_target<'gc>(
     let handlers: Vec<FunctionObject<'gc>> = dispatch_list
         .as_dispatch_mut(activation.gc())
         .expect("Internal dispatch list is missing during dispatch!")
-        .iter_event_handlers(name, use_capture)
+        .iter_event_handlers(activation.gc(), name, use_capture)
         .collect();
 
     if !handlers.is_empty() {

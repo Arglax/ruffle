@@ -250,6 +250,11 @@ impl<'gc> LoadManager<'gc> {
     }
 
     /// Retrieve a loader by handle.
+    /// MVS: loaders still kept (for the memory report).
+    pub fn mvs_len(&self) -> usize {
+        self.0.len()
+    }
+
     pub fn get_loader(&self, handle: LoaderHandle) -> Option<&MovieLoader<'gc>> {
         self.0.get(handle)
     }

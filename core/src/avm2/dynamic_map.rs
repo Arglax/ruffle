@@ -1,4 +1,5 @@
 use crate::avm2::object::Object;
+use crate::avm2::object::TObject as _;
 use crate::string::AvmString;
 use fnv::FnvBuildHasher;
 use gc_arena::Collect;
@@ -30,17 +31,19 @@ pub enum DynamicKey<'gc> {
 ///
 /// Uses `HashTable` directly to expose stable bucket indices, which are
 /// needed for correct iteration when entries are added or removed mid-iteration.
-#[derive(Debug, Clone, Collect)]
-#[collect(no_drop)]
+#[derive(Debug, Clone)]
 pub struct DynamicMap<K, V> {
     table: HashTable<(K, DynamicProperty<V>)>,
-    #[collect(require_static)]
+    /// MVS: `new Dictionary(true)`: object keys don't keep their entries alive (see `Collect` below
+    /// and `Library::mvs_keep`).
+    weak_keys: Cell<bool>,
+
     hasher: FnvBuildHasher,
     // The last index that was given back to flash
-    #[collect(require_static)]
+
     public_index: Cell<usize>,
     // The actual bucket index that represents where an item is in the table
-    #[collect(require_static)]
+
     real_index: Cell<usize>,
 }
 
@@ -61,7 +64,17 @@ impl<K: Eq + Hash, V> DynamicMap<K, V> {
             hasher: FnvBuildHasher::default(),
             public_index: Cell::new(0),
             real_index: Cell::new(0),
+            weak_keys: Cell::new(false),
         }
+    }
+
+    /// MVS: whether object keys are held weakly (`new Dictionary(true)`).
+    pub fn weak_keys(&self) -> bool {
+        self.weak_keys.get()
+    }
+
+    pub fn set_weak_keys(&self) {
+        self.weak_keys.set(true);
     }
 
     pub fn get(&self, key: &K) -> Option<&DynamicProperty<V>> {
@@ -254,6 +267,28 @@ mod tests {
         while let Some(next) = map.next(current) {
             println!("{}", map.key_at(current).unwrap());
             current = next;
+        }
+    }
+}
+
+// MVS: like the derived impl, except that in a weak-keyed map (`new Dictionary(true)`) an entry with an
+// object key is traced weakly: the key doesn't keep itself alive, and its value is kept by
+// `Library::mvs_keep` only while the key is in use elsewhere (an ephemeron, as in Flash). Entries
+// whose key died are removed before the sweep that frees it.
+unsafe impl<'gc> Collect<'gc> for DynamicMap<DynamicKey<'gc>, crate::avm2::Value<'gc>> {
+    fn trace<T: gc_arena::collect::Trace<'gc>>(&self, cc: &mut T) {
+        let weak = self.weak_keys.get();
+        for (key, prop) in self.table.iter() {
+            match key {
+                DynamicKey::Object(o) if weak => {
+                    // SAFETY: the object is a live GC value; this only records a weak reference.
+                    cc.trace_gc_weak(unsafe { gc_arena::GcWeak::from_ptr(o.as_ptr() as *const ()) });
+                }
+                _ => {
+                    cc.trace(key);
+                    cc.trace(&prop.value);
+                }
+            }
         }
     }
 }

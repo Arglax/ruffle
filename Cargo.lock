@@ -2076,8 +2076,6 @@ dependencies = [
 [[package]]
 name = "gc-arena"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "160a11f93020eea95cb4c59e2eda2e4c6353f75aa4fbb01f2bf8729b2e4d6dd2"
 dependencies = [
  "enum-map",
  "gc-arena-derive",

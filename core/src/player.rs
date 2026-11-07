@@ -305,6 +305,11 @@ impl<'gc> GcRootData<'gc> {
 
 type GcArena = gc_arena::Arena<Rootable![GcRoot<'_>]>;
 
+/// MVS: collection statistics for the memory report (`Player::mvs_mem`).
+static MVS_GC_CYCLES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static MVS_GC_PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static MVS_GC_MAX_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum RunState {
     Playing,
@@ -364,6 +369,9 @@ pub struct Player {
     /// This is how we support custom SWF framerates
     /// and compensate for small lags by "catching up" (up to MAX_FRAMES_PER_TICK).
     frame_accumulator: FloatDuration,
+
+    /// MVS: game frames run so far.
+    mvs_frames_run: u32,
     recent_run_frame_timings: VecDeque<f64>,
 
     /// Faked time passage for fooling hand-written busy-loop FPS limiters.
@@ -558,7 +566,10 @@ impl Player {
         let max_frames_per_tick = self.max_frames_per_tick();
         let mut frame = 0;
 
-        while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
+        let pacing_slack = FloatDuration::from_millis(
+            (dt.as_millis() * 0.5).min(frame_duration.as_millis() * 0.25).max(0.0),
+        );
+        while frame < max_frames_per_tick && self.frame_accumulator + pacing_slack >= frame_duration {
             let timer = Instant::now();
             self.run_frame();
             let elapsed = timer.elapsed().as_millis() as f64;
@@ -951,6 +962,158 @@ impl Player {
 
     pub fn needs_render(&self) -> bool {
         self.needs_render
+    }
+
+    /// MVS: what the frame loop visits (see `orphan_manager::mvs_census`).
+    pub fn mvs_census(&mut self) -> String {
+        self.mutate_with_update_context(|context| crate::orphan_manager::mvs_census(context))
+    }
+
+    /// MVS: collection cycles finished, finalization passes in the last one, and the longest
+    /// collection step (ms) since the last memory report.
+    /// MVS: where memory goes: live GC objects, kept movie libraries (and their size), orphans,
+    /// pending loaders.
+    pub fn mvs_mem(&mut self) -> String {
+        let gcs = self.gc_arena.borrow().metrics().total_gc_count();
+        let (libs, lib_bytes, orphans, removed, loaders) = self.mutate_with_update_context(|uc| {
+            let (libs, lib_bytes) = uc.library.mvs_stats();
+            let (orphans, removed) = uc.orphan_manager.mvs_counts();
+            (libs, lib_bytes, orphans, removed, uc.load_manager.mvs_len())
+        });
+        use std::sync::atomic::Ordering::Relaxed;
+        format!(
+            "gc {gcs}, cycles {} (last {} passes), longest gc step {} ms, libraries {libs} ({} MB), orphans {orphans} ({removed} removed), loaders {loaders}",
+            MVS_GC_CYCLES.load(Relaxed),
+            MVS_GC_PASSES.load(Relaxed),
+            MVS_GC_MAX_MS.swap(0, Relaxed),
+            lib_bytes / 1_048_576
+        )
+    }
+
+    /// MVS: what keeps orphans that were taken off the stage alive: for up to three of them (AQW
+    /// avatars first), the shortest chain of strong references from the GC root, as type names.
+    pub fn mvs_find_holders(&mut self) -> String {
+        use std::collections::{HashMap, VecDeque};
+        let targets = self.mutate_with_update_context(crate::orphan_manager::mvs_holder_targets);
+        if targets.is_empty() {
+            return "no removed orphans alive".to_string();
+        }
+        fn short(name: &str) -> String {
+            // Drop module paths: "a::b::Type<c::D>" -> "Type<D>".
+            let mut out = String::new();
+            let mut word = String::new();
+            let mut chars = name.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == ':' && chars.peek() == Some(&':') {
+                    chars.next();
+                    word.clear();
+                } else if c.is_alphanumeric() || c == '_' {
+                    word.push(c);
+                } else {
+                    out.push_str(&word);
+                    word.clear();
+                    out.push(c);
+                }
+            }
+            out.push_str(&word);
+            out
+        }
+        let arena = self.gc_arena.borrow();
+        arena.mutate(|_, root| {
+            let mut want: HashMap<*const (), usize> = HashMap::new();
+            for (i, (d, o, _)) in targets.iter().enumerate() {
+                want.insert(*d, i);
+                if !o.is_null() {
+                    want.insert(*o, i);
+                }
+            }
+            let mut parent: HashMap<*const (), *const ()> = HashMap::new();
+            let mut queue = VecDeque::new();
+            for e in gc_arena::mvs::root_edges(root) {
+                if parent.insert(e, std::ptr::null()).is_none() {
+                    queue.push_back(e);
+                }
+            }
+            let mut found: Vec<(usize, *const ())> = Vec::new();
+            let mut visited = 0usize;
+            while let Some(p) = queue.pop_front() {
+                visited += 1;
+                if let Some(i) = want.get(&p) {
+                    if !found.iter().any(|(j, _)| j == i) {
+                        found.push((*i, p));
+                        if found.len() == targets.len() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // SAFETY: reached through strong pointers from the root, outside collection.
+                for e in unsafe { gc_arena::mvs::edges(p) } {
+                    if let std::collections::hash_map::Entry::Vacant(v) = parent.entry(e) {
+                        v.insert(p);
+                        queue.push_back(e);
+                    }
+                }
+            }
+            let mut out = format!("visited {visited} objects; ");
+            for (i, (_, _, class)) in targets.iter().enumerate() {
+                match found.iter().find(|(j, _)| *j == i) {
+                    None => out.push_str(&format!("[{class}: not reachable from the root] ")),
+                    Some((_, hit)) => {
+                        let mut chain = Vec::new();
+                        let mut p = *hit;
+                        while !p.is_null() {
+                            // SAFETY: as above.
+                            chain.push(short(unsafe { gc_arena::mvs::type_name(p) }));
+                            p = parent.get(&p).copied().unwrap_or(std::ptr::null());
+                        }
+                        chain.reverse();
+                        out.push_str(&format!("[{class}: root > {}] ", chain.join(" > ")));
+                    }
+                }
+            }
+            out
+        })
+    }
+
+    /// MVS: the AS3 classes of the object the mouse is pressing and its ancestors, innermost
+    /// first, joined with ">" (empty when nothing is pressed). The game page reads it on touch-down
+    /// to decide whether a finger drag should scroll the list under it.
+    pub fn mvs_press_chain(&mut self) -> String {
+        use crate::avm2::object::TObject;
+        self.mutate_with_update_context(|uc| {
+            let mut names = Vec::new();
+            let mut d = uc.mouse_data.pressed.map(|i| i.as_displayobject());
+            while let Some(obj) = d {
+                if let Some(o) = obj.object2() {
+                    names.push(o.instance_class().name().local_name().to_string());
+                }
+                d = obj.parent();
+            }
+            names.join(">")
+        })
+    }
+
+    /// MVS: how many game frames have run (for frame-rate measuring).
+    pub fn mvs_frames_run(&self) -> u32 {
+        self.mvs_frames_run
+    }
+
+    /// MVS: draws an in-between picture (see `display_object::mvs_interp`), placed by how far the
+    /// player is into the current frame interval.
+    pub fn render_interpolated(&mut self) {
+        let duration = self.frame_duration().as_millis();
+        let alpha = if duration > 0.0 {
+            (self.frame_accumulator.as_millis() / duration) as f32
+        } else {
+            1.0
+        };
+        // needs_render: a game frame ran (or something else changed) since the last picture.
+        crate::display_object::mvs_interp::set_fresh(self.needs_render);
+        crate::display_object::mvs_interp::set_alpha(Some(alpha));
+        self.render();
+        crate::display_object::mvs_interp::set_alpha(None);
+        crate::display_object::mvs_interp::set_fresh(true);
     }
 
     pub fn background_color(&mut self) -> Option<Color> {
@@ -2059,6 +2222,8 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn run_frame(&mut self) {
+        crate::display_object::mvs_interp::next_frame();
+        self.mvs_frames_run = self.mvs_frames_run.wrapping_add(1);
         let frame_time = self.frame_time(750_000_000.0);
         let frame_time = Duration::from_nanos(frame_time as u64);
         let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
@@ -2450,9 +2615,57 @@ impl Player {
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
         // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        Self::mvs_collect(&mut self.gc_arena.borrow_mut());
 
         rval
+    }
+
+    /// MVS: `collect_debt`, plus freeing the libraries of movies nothing uses any more (see
+    /// `Library::mvs_keep`). When marking finishes, every library and class symbol still in use is
+    /// kept, and what that keeps is marked right away (the game does not run in between, so held
+    /// libraries never need write barriers), until nothing new is kept. The rest are forgotten and
+    /// the sweep frees them.
+    fn mvs_collect(arena: &mut GcArena) {
+        let started = Instant::now();
+        if arena.mutate(|_, root| {
+            let data = root.data.borrow();
+            data.library.mvs_needs_prepare(data.root_swf)
+        }) {
+            arena.mutate(|mc, root| {
+                let mut data = root.data.borrow_mut(mc);
+                let root_swf = data.root_swf;
+                data.library.mvs_prepare(mc, root_swf)
+            });
+        }
+        let free = crate::display_object::mvs_interp::free_libraries();
+        if let Some(marked) = arena.mark_debt() {
+            let mut passes = 1;
+            let mut kept = marked.finalize(|fc, root| root.data.borrow().library.mvs_keep(fc, free));
+            while kept {
+                let Some(marked) = arena.finish_marking() else {
+                    break;
+                };
+                passes += 1;
+                kept = marked.finalize(|fc, root| root.data.borrow().library.mvs_keep(fc, free));
+            }
+            if free {
+                if let Some(marked) = arena.finish_marking() {
+                    marked.finalize(|fc, root| {
+                        if root.data.borrow().library.mvs_has_dead(fc) {
+                            root.data.borrow_mut(fc).library.mvs_drop_dead(fc);
+                        }
+                    });
+                }
+            }
+            MVS_GC_CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            MVS_GC_PASSES.store(passes, std::sync::atomic::Ordering::Relaxed);
+            // Sweep; never starts the next cycle's marking (that must go through mark_debt).
+            arena.cycle_debt();
+        } else if arena.collection_phase() == gc_arena::arena::CollectionPhase::Sweeping {
+            arena.cycle_debt();
+        }
+        let ms = started.elapsed().as_micros() as u32 / 1000;
+        MVS_GC_MAX_MS.fetch_max(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn flush_shared_objects(&mut self) {
@@ -3094,6 +3307,7 @@ impl PlayerBuilder {
                 forced_frame_rate,
                 frame_phase: Default::default(),
                 frame_accumulator: FloatDuration::ZERO,
+                mvs_frames_run: 0,
                 recent_run_frame_timings: VecDeque::with_capacity(10),
                 start_time: Instant::now(),
                 time_offset: 0,

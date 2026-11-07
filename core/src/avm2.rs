@@ -49,7 +49,7 @@ pub mod bytearray;
 mod call_stack;
 mod class;
 mod domain;
-mod dynamic_map;
+pub(crate) mod dynamic_map;
 mod e4x;
 pub mod error;
 pub mod error_messages;
@@ -82,11 +82,12 @@ mod value;
 pub mod vector;
 mod verify;
 mod vtable;
+pub use vtable::mvs_set_const_overrides;
 
 pub use crate::avm2::activation::Activation;
 pub use crate::avm2::array::ArrayStorage;
 pub use crate::avm2::call_stack::CallStack;
-pub use crate::avm2::class::Class;
+pub use crate::avm2::class::{Class, ClassWeak};
 #[allow(unused)] // For debug_ui
 pub use crate::avm2::domain::{Domain, DomainPtr};
 pub use crate::avm2::error::Error;

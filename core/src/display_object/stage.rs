@@ -621,6 +621,17 @@ impl<'gc> Stage<'gc> {
     /// You can easily observe the difference between render_viewport and render
     /// in FP by checking which stuff can be rendered using `BitmapData.draw`.
     pub fn render_viewport(self, context: &mut RenderContext<'_, 'gc>) {
+        use crate::display_object::mvs_cull;
+        mvs_cull::clear();
+        if !context.is_offscreen {
+            let size = context.renderer.viewport_dimensions();
+            mvs_cull::push(swf::Rectangle {
+                x_min: swf::Twips::ZERO,
+                y_min: swf::Twips::ZERO,
+                x_max: swf::Twips::from_pixels(size.width as f64),
+                y_max: swf::Twips::from_pixels(size.height as f64),
+            });
+        }
         context.transform_stack.push(&Transform {
             matrix: self.0.viewport_matrix.get(),
             color_transform: Default::default(),
@@ -650,6 +661,7 @@ impl<'gc> Stage<'gc> {
         }
 
         context.transform_stack.pop();
+        mvs_cull::clear();
     }
 
     /// Draw the stage's letterbox.

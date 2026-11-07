@@ -368,6 +368,25 @@ impl<'gc> ClassObject<'gc> {
 
         class_init_fn.call(activation, self_value, FunctionArgs::empty())?;
 
+        // MVS: a class initializer may set a constant in code instead of declaring its value, so
+        // overridden constants are set again once it has run (see `vtable::mvs_const_override`).
+        let overrides = crate::avm2::vtable::mvs_const_overrides_for(&c_class.name().local_name().to_string());
+        for (name, v) in overrides {
+            let multiname = crate::avm2::Multiname::new(
+                activation.avm2().find_public_namespace(),
+                AvmString::new_utf8(activation.gc(), name),
+            );
+            if let Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) =
+                self.vtable().get_trait(&multiname)
+            {
+                let value = match self.base().get_slot(slot_id) {
+                    Value::Integer(_) => Value::Integer(v as i32),
+                    _ => Value::Number(v),
+                };
+                self.set_slot_no_coerce(slot_id, value, activation.gc());
+            }
+        }
+
         Ok(())
     }
 

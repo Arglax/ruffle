@@ -206,3 +206,7 @@ lto = "off"
 incremental = true
 # Right between the defaults of 16 and 256, for crate fragment caching.
 codegen-units = 64
+
+[patch.crates-io]
+# MVS: gc-arena with heap inspection (vendor/gc-arena/src/mvs.rs).
+gc-arena = { path = "vendor/gc-arena" }

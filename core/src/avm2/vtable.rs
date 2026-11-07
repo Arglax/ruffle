@@ -442,6 +442,8 @@ impl<'gc> VTable<'gc> {
                     let slot_id = *slot_id;
 
                     let default_value = trait_to_default_value(trait_data);
+                    let default_value =
+                        mvs_const_override(defining_class_def, trait_data, default_value);
 
                     let prop_class = match trait_data.kind() {
                         TraitKind::Slot { slot_type, .. } | TraitKind::Const { slot_type, .. } => {
@@ -616,6 +618,59 @@ impl VTableInitError {
             VTableInitError::SlotConflict => make_error_1107(activation),
         }
     }
+}
+
+/// MVS: values that replace class constants' declared values, as ("Class.NAME", value). The game
+/// page sets them (window.__mvsAs3Consts) before the game loads; MVS uses this to make AQW's item
+/// lists touch-friendly on phones (`LPFFrameInvAQ.ROW_H`, the row height every list window uses).
+static MVS_CONSTS: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn mvs_set_const_overrides(list: Vec<(String, f64)>) {
+    if let Ok(mut consts) = MVS_CONSTS.lock() {
+        *consts = list;
+    }
+}
+
+/// MVS: the overrides for this class's public constants, as (name, value).
+pub fn mvs_const_overrides_for(class_name: &str) -> Vec<(String, f64)> {
+    let class_name = class_name.trim_end_matches('$');
+    let Ok(consts) = MVS_CONSTS.lock() else {
+        return Vec::new();
+    };
+    consts
+        .iter()
+        .filter_map(|(key, v)| {
+            let (c, t) = key.split_once('.')?;
+            (c == class_name).then(|| (t.to_string(), *v))
+        })
+        .collect()
+}
+
+fn mvs_const_override<'gc>(class: Class<'gc>, trait_data: &Trait<'gc>, value: Value<'gc>) -> Value<'gc> {
+    if !matches!(trait_data.kind(), TraitKind::Const { .. } | TraitKind::Slot { .. }) {
+        return value;
+    }
+    let Ok(consts) = MVS_CONSTS.lock() else {
+        return value;
+    };
+    if consts.is_empty() {
+        return value;
+    }
+    let class_name = class.name().local_name().to_string();
+    let class_name = class_name.trim_end_matches('$');
+    let trait_name = trait_data.name().local_name().to_string();
+    for (key, v) in consts.iter() {
+        if let Some((c, t)) = key.split_once('.')
+            && c == class_name
+            && t == trait_name
+        {
+            return match value {
+                Value::Integer(_) => Value::Integer(*v as i32),
+                _ => Value::Number(*v),
+            };
+        }
+    }
+    value
 }
 
 fn trait_to_default_value<'gc>(trait_data: &Trait<'gc>) -> Value<'gc> {

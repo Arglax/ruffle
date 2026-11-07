@@ -123,6 +123,8 @@ struct RuffleInstance {
     device_pixel_ratio: f64,
     window: Window,
     timestamp: Option<f64>,
+    /// MVS: when the last picture was drawn (for in-betweening, see `tick`).
+    mvs_last_render: f64,
     animation_handler: Option<AnimationHandler>, // requestAnimationFrame callback
     animation_handler_id: Option<NonZeroI32>,    // requestAnimationFrame id
     background_tick_mode: bool,
@@ -569,6 +571,7 @@ impl RuffleHandle {
             focus_on_press_callback: None,
             webglcontextlost_callback: None,
             timestamp: None,
+            mvs_last_render: 0.0,
             has_focus: false,
             trace_observer: player.trace_observer,
             log_subscriber,
@@ -678,6 +681,14 @@ impl RuffleHandle {
                         let handled = instance
                             .with_core_mut(|core| core.handle_event(event))
                             .unwrap_or_default();
+                        // MVS: what was pressed, for the page's finger-swipe scrolling (bridge.js).
+                        if let Ok(chain) = instance.with_core_mut(|core| core.mvs_press_chain()) {
+                            let _ = js_sys::Reflect::set(
+                                instance.window.as_ref(),
+                                &JsValue::from_str("__mvsPressChain"),
+                                &JsValue::from_str(&chain),
+                            );
+                        }
 
                         if handled && matches!(button, MouseButton::Right) {
                             js_player_callback.suppress_context_menu();
@@ -1123,7 +1134,53 @@ impl RuffleHandle {
         let mut dt = 0.0;
         let mut new_dimensions = None;
         let mut gamepad_button_events = Vec::new();
+        let mut in_background = false;
+        // MVS: the page sets window.__mvsInterp to the most pictures a second to draw (0 = off) and
+        // reads window.__mvsFrames, the game frames run so far.
+        let mut mvs_interp_hz = 0.0;
+        let mut mvs_since_render = f64::INFINITY;
+        let mut mvs_window = None;
+        let mut mvs_no_draw = false;
         let _ = self.with_instance_mut(|instance| {
+            in_background = instance.background_tick_mode;
+            mvs_interp_hz = js_sys::Reflect::get(instance.window.as_ref(), &JsValue::from_str("__mvsInterp"))
+                .ok()
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            mvs_since_render = timestamp - instance.mvs_last_render;
+            let flag = |name: &str| {
+                js_sys::Reflect::get(instance.window.as_ref(), &JsValue::from_str(name))
+                    .ok()
+                    .is_some_and(|v| v.is_truthy())
+            };
+            ruffle_core::mvs_set_freeze(flag("__mvsFreezeHidden"), flag("__mvsFreezeOrphans"));
+            // MVS: window.__mvsKeepLibraries keeps every loaded movie's library forever (upstream).
+            ruffle_core::mvs_set_free_libraries(!flag("__mvsKeepLibraries"));
+            // MVS: window.__mvsAs3Consts ({"Class.NAME": number}) replaces class constants; read once,
+            // before the game's classes load.
+            static MVS_CONSTS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !MVS_CONSTS_READ.load(std::sync::atomic::Ordering::Relaxed)
+                && let Ok(consts) = js_sys::Reflect::get(instance.window.as_ref(), &JsValue::from_str("__mvsAs3Consts"))
+                && consts.is_object()
+            {
+                MVS_CONSTS_READ.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut list = Vec::new();
+                if let Ok(keys) = js_sys::Reflect::own_keys(&consts) {
+                    for key in keys.iter() {
+                        if let (Some(k), Some(v)) = (
+                            key.as_string(),
+                            js_sys::Reflect::get(&consts, &key).ok().and_then(|v| v.as_f64()),
+                        ) {
+                            list.push((k, v));
+                        }
+                    }
+                }
+                ruffle_core::mvs_set_const_overrides(list);
+            }
+            // MVS bot-only mode: the game keeps running at full speed but nothing is drawn.
+            mvs_no_draw = flag("__mvsNoDraw");
+            mvs_window = Some(instance.window.clone());
+
             // Check for canvas resize.
             let canvas_width = instance.canvas.client_width();
             let canvas_height = instance.canvas.client_height();
@@ -1225,6 +1282,7 @@ impl RuffleHandle {
         });
 
         // Tick the Ruffle core.
+        let mut mvs_rendered = false;
         let _ = self.with_core_mut(|core| {
             for event in gamepad_button_events {
                 core.handle_event(event);
@@ -1243,13 +1301,84 @@ impl RuffleHandle {
                 });
             }
 
+            let frames_before = core.mvs_frames_run();
             core.tick(FloatDuration::from_millis(dt));
+            // MVS: window.__mvsCensus = true asks once for a count of what the frame loop visits.
+            if let Some(window) = &mvs_window
+                && js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__mvsCensus"))
+                    .ok()
+                    .is_some_and(|v| v.is_truthy())
+            {
+                let census = core.mvs_census();
+                let _ = js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("__mvsCensus"), &JsValue::FALSE);
+                let _ = js_sys::Reflect::set(
+                    window.as_ref(),
+                    &JsValue::from_str("__mvsCensusResult"),
+                    &JsValue::from_str(&census),
+                );
+            }
+            // MVS: window.__mvsFindHolder = true asks once what keeps removed orphans alive.
+            if let Some(window) = &mvs_window
+                && js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__mvsFindHolder"))
+                    .ok()
+                    .is_some_and(|v| v.is_truthy())
+            {
+                let _ = js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("__mvsFindHolder"), &JsValue::FALSE);
+                let result = core.mvs_find_holders();
+                let _ = js_sys::Reflect::set(
+                    window.as_ref(),
+                    &JsValue::from_str("__mvsHolderResult"),
+                    &JsValue::from_str(&result),
+                );
+            }
+            // MVS: every 150 game frames (about 5 s), a memory report in window.__mvsMem.
+            if core.mvs_frames_run() / 150 != frames_before / 150
+                && let Some(window) = &mvs_window
+            {
+                let wasm_mb = core::arch::wasm32::memory_size(0) * 65536 / 1_048_576;
+                let report = format!("wasm {wasm_mb} MB, {}", core.mvs_mem());
+                let _ = js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("__mvsMem"), &JsValue::from_str(&report));
+            }
+            if core.mvs_frames_run() != frames_before
+                && let Some(window) = &mvs_window
+            {
+                let _ = js_sys::Reflect::set(
+                    window.as_ref(),
+                    &JsValue::from_str("__mvsFrames"),
+                    &JsValue::from_f64(core.mvs_frames_run() as f64),
+                );
+            }
 
-            // Render if the core signals a new frame, or if we resized.
-            if core.needs_render() || new_dimensions.is_some() {
+            // Render if the core signals a new frame, or if we resized. A hidden page keeps
+            // running the movie but draws nothing: the pending frame stays flagged and is
+            // drawn by the first tick after the page is shown again.
+            if in_background || mvs_no_draw {
+                return;
+            }
+            if mvs_interp_hz > 0.0 && new_dimensions.is_none() {
+                // MVS in-betweening: also draw between game frames, at most mvs_interp_hz a second.
+                if core.needs_render() || mvs_since_render >= 1000.0 / mvs_interp_hz - 2.0 {
+                    core.render_interpolated();
+                    mvs_rendered = true;
+                }
+            } else if core.needs_render() || new_dimensions.is_some() {
                 core.render();
+                mvs_rendered = true;
             }
         });
+        if mvs_rendered {
+            let _ = self.with_instance_mut(|instance| instance.mvs_last_render = timestamp);
+            // MVS: pictures drawn so far (window.__mvsDrawn), for the page's FPS meter and Auto smooth.
+            static MVS_DRAWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let drawn = MVS_DRAWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if let Some(window) = &mvs_window {
+                let _ = js_sys::Reflect::set(
+                    window.as_ref(),
+                    &JsValue::from_str("__mvsDrawn"),
+                    &JsValue::from_f64(drawn as f64),
+                );
+            }
+        }
     }
 
     fn on_metadata(self, swf_header: &ruffle_core::swf::HeaderExt) {

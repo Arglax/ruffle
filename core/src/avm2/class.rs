@@ -241,9 +241,29 @@ impl<'gc> ClassData<'gc> {
     }
 }
 
+/// MVS: a weak handle to a class (see `Avm2ClassRegistry` in library.rs).
+#[derive(Collect, Clone, Copy)]
+#[collect(no_drop)]
+pub struct ClassWeak<'gc>(gc_arena::GcWeak<'gc, ClassData<'gc>>);
+
+impl<'gc> ClassWeak<'gc> {
+    pub fn is_dead(self, fc: &gc_arena::Finalization<'gc>) -> bool {
+        self.0.is_dead(fc)
+    }
+
+    pub fn resurrect(self, fc: &gc_arena::Finalization<'gc>) {
+        let _ = self.0.resurrect(fc);
+    }
+}
+
 impl<'gc> Class<'gc> {
     pub fn as_ptr(self) -> *const () {
         Gc::as_ptr(self.0).cast()
+    }
+
+    /// MVS: a weak handle to this class.
+    pub fn mvs_downgrade(self) -> ClassWeak<'gc> {
+        ClassWeak(Gc::downgrade(self.0))
     }
 
     /// Create an unlinked class from its name, superclass, and traits.
