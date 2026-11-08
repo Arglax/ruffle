@@ -63,6 +63,7 @@ thread_local! {
 }
 
 type AnimationHandler = Closure<dyn FnMut(f64)>;
+type ResizeObserverCallback = Closure<dyn FnMut(js_sys::Array)>;
 
 struct JsCallback<E> {
     target: EventTarget,
@@ -121,6 +122,11 @@ struct RuffleInstance {
     canvas_width: i32,
     canvas_height: i32,
     device_pixel_ratio: f64,
+    /// Set by `resize_observer` when the canvas changes size. Reading `clientWidth` and
+    /// `clientHeight` forces a synchronous layout whenever the page has changed since the last one,
+    /// so the size is only read after a resize instead of on every tick.
+    resize_dirty: Rc<std::cell::Cell<bool>>,
+    resize_observer: Option<(web_sys::ResizeObserver, ResizeObserverCallback)>,
     window: Window,
     timestamp: Option<f64>,
     animation_handler: Option<AnimationHandler>, // requestAnimationFrame callback
@@ -540,6 +546,23 @@ impl RuffleHandle {
             callstack = Some(core.callstack());
         }
 
+        // Watch the canvas for resizes, so that `tick` only reads its size after one. Without
+        // ResizeObserver, the size is read on every tick.
+        let resize_dirty = Rc::new(std::cell::Cell::new(true));
+        let resize_observer = {
+            let dirty = resize_dirty.clone();
+            let closure =
+                Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| {
+                    dirty.set(true);
+                });
+            web_sys::ResizeObserver::new(closure.as_ref().unchecked_ref())
+                .ok()
+                .map(|observer| {
+                    observer.observe(&player.canvas);
+                    (observer, closure)
+                })
+        };
+
         // Create instance.
         let instance = RuffleInstance {
             core: player.core,
@@ -549,6 +572,8 @@ impl RuffleHandle {
             canvas_width: 0, // Initialize canvas width and height to 0 to force an initial canvas resize.
             canvas_height: 0,
             device_pixel_ratio: window.device_pixel_ratio(),
+            resize_dirty,
+            resize_observer,
             window: window.clone(),
             animation_handler: None,
             animation_handler_id: None,
@@ -1125,8 +1150,15 @@ impl RuffleHandle {
         let mut gamepad_button_events = Vec::new();
         let _ = self.with_instance_mut(|instance| {
             // Check for canvas resize.
-            let canvas_width = instance.canvas.client_width();
-            let canvas_height = instance.canvas.client_height();
+            let (canvas_width, canvas_height) =
+                if instance.resize_observer.is_none() || instance.resize_dirty.replace(false) {
+                    (
+                        instance.canvas.client_width(),
+                        instance.canvas.client_height(),
+                    )
+                } else {
+                    (instance.canvas_width, instance.canvas_height)
+                };
             let device_pixel_ratio = instance.window.device_pixel_ratio(); // Changes via user zooming.
             if instance.canvas_width != canvas_width
                 || instance.canvas_height != canvas_height
@@ -1311,6 +1343,9 @@ impl RuffleInstance {
 
 impl Drop for RuffleInstance {
     fn drop(&mut self) {
+        if let Some((observer, _)) = &self.resize_observer {
+            observer.disconnect();
+        }
         self.canvas.remove();
 
         // Stop all audio playing from the instance.

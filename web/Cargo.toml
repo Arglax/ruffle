@@ -74,7 +74,7 @@ features = [
     "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Location", "PageTransitionEvent", "PointerEvent",
     "Request", "RequestInit", "Response", "Storage", "WheelEvent", "Window", "ReadableStream", "RequestCredentials",
     "Url", "WebGlContextEvent", "Clipboard", "FocusEvent", "FocusOptions", "ShadowRoot", "Gamepad", "GamepadButton", "OffscreenCanvas",
-    "TextMetrics", "OffscreenCanvasRenderingContext2d"
+    "TextMetrics", "OffscreenCanvasRenderingContext2d", "ResizeObserver"
 ]
 
 [target.'cfg(target_family = "wasm")'.dependencies]
