@@ -660,6 +660,10 @@ impl<'gc> Library<'gc> {
     /// MVS: run at the start of each collection step: libraries made since the last step (other
     /// than the root movie's) move into their own allocations, held weakly from then on.
     pub fn mvs_prepare(&mut self, mc: &Mutation<'gc>, root: SwfMovie<'gc>) {
+        // Arglax: window.__mvsUpstreamLibraries keeps every library in its owned slot, as upstream.
+        if crate::display_object::mvs_interp::upstream_libraries() {
+            return;
+        }
         // Under an AVM2 root (AQWorlds) every loaded movie's library can be freed, AVM1 item and
         // effect movies included: keeping those grew AQW's memory by hundreds of MB.
         let root_avm2 = root.is_action_script_3();

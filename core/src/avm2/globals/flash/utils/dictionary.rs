@@ -7,6 +7,10 @@ pub fn mvs_weak_keys<'gc>(
     _args: crate::avm2::function::FunctionArgs<'_, 'gc>,
 ) -> Result<crate::avm2::Value<'gc>, crate::avm2::Error<'gc>> {
     use crate::avm2::object::TObject as _;
+    // Arglax: window.__mvsStrongDicts keeps keys strong, as upstream.
+    if crate::display_object::mvs_interp::strong_dicts() {
+        return Ok(crate::avm2::Value::Undefined);
+    }
     if let Some(this) = this.as_object() {
         this.base().values().set_weak_keys();
         activation.context.library.mvs_register_weak_dict(this);

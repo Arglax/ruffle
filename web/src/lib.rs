@@ -1182,6 +1182,12 @@ impl RuffleHandle {
             ruffle_render_webgl::arglax_set_batching(!flag("__arglaxNoBatch"));
             // MVS: window.__mvsKeepLibraries keeps every loaded movie's library forever (upstream).
             ruffle_core::mvs_set_free_libraries(!flag("__mvsKeepLibraries"));
+            // Arglax: off switches for MVS's weak-reference features (crash bisecting).
+            ruffle_core::mvs_set_memory_switches(
+                flag("__mvsUpstreamLibraries"),
+                flag("__mvsStrongDicts"),
+                flag("__mvsStrongHandlers"),
+            );
             // MVS: window.__mvsAs3Consts ({"Class.NAME": number}) replaces class constants; read once,
             // before the game's classes load.
             static MVS_CONSTS_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

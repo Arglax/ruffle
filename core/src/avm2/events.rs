@@ -227,7 +227,11 @@ impl<'gc> DispatchList<'gc> {
         // stage and other long-lived objects (drop windows, item lists, chat, the camera) and
         // relies on Flash to let them go. Other functions stay strongly held, so a one-off
         // anonymous handler can't be collected before it runs.
-        let new_handler = if use_weak_reference && handler.executable().is_bound() {
+        // Arglax: window.__mvsStrongHandlers holds every handler strongly, as upstream.
+        let new_handler = if use_weak_reference
+            && handler.executable().is_bound()
+            && !crate::display_object::mvs_interp::strong_handlers()
+        {
             EventHandler {
                 handler: HandlerRef::Weak(FunctionObjectWeak(Gc::downgrade(handler.0))),
                 use_capture,

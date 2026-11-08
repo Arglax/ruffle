@@ -1099,6 +1099,32 @@ pub mod mvs_interp {
         FREE_LIBRARIES.load(Relaxed)
     }
 
+    /// Arglax: off switches for MoVibeSkua's weak-reference memory features, to bisect crashes
+    /// (window.__mvsUpstreamLibraries / __mvsStrongDicts / __mvsStrongHandlers). Each restores
+    /// upstream behaviour: libraries never leave their owned slot, `new Dictionary(true)` keeps
+    /// strong keys, `useWeakReference` handlers are held strongly. All off by default.
+    static UPSTREAM_LIBRARIES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static STRONG_DICTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static STRONG_HANDLERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_memory_switches(upstream_libraries: bool, strong_dicts: bool, strong_handlers: bool) {
+        UPSTREAM_LIBRARIES.store(upstream_libraries, Relaxed);
+        STRONG_DICTS.store(strong_dicts, Relaxed);
+        STRONG_HANDLERS.store(strong_handlers, Relaxed);
+    }
+
+    pub fn upstream_libraries() -> bool {
+        UPSTREAM_LIBRARIES.load(Relaxed)
+    }
+
+    pub fn strong_dicts() -> bool {
+        STRONG_DICTS.load(Relaxed)
+    }
+
+    pub fn strong_handlers() -> bool {
+        STRONG_HANDLERS.load(Relaxed)
+    }
+
     /// Whether a game frame ran since the last picture (set for each picture while in-betweening).
     static FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 

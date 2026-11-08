@@ -8,6 +8,7 @@
 #[macro_use]
 mod display_object;
 pub use display_object::mvs_interp::set_free_libraries as mvs_set_free_libraries;
+pub use display_object::mvs_interp::set_memory_switches as mvs_set_memory_switches;
 pub use avm2::mvs_set_const_overrides;
 pub use display_object::mvs_interp::set_freeze as mvs_set_freeze;
 pub use display_object::{StageAlign, StageDisplayState, StageScaleMode};
