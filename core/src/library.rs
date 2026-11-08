@@ -660,17 +660,21 @@ impl<'gc> Library<'gc> {
     /// MVS: run at the start of each collection step: libraries made since the last step (other
     /// than the root movie's) move into their own allocations, held weakly from then on.
     pub fn mvs_prepare(&mut self, mc: &Mutation<'gc>, root: SwfMovie<'gc>) {
+        // Under an AVM2 root (AQWorlds) every loaded movie's library can be freed, AVM1 item and
+        // effect movies included: keeping those grew AQW's memory by hundreds of MB.
+        let root_avm2 = root.is_action_script_3();
         let root = root.as_ptr() as usize;
         let keys: Vec<usize> = self
             .movie_libraries
             .slots
             .iter()
             .filter(|(key, slot)| {
-                // Only AVM2 movies' libraries are freed (proven on AQW). AVM1 games such as
-                // DragonFable crashed with them held weakly ("memory access out of bounds" in
-                // `Drawing::clone` while instantiating a library symbol, then "null function"),
-                // so their libraries stay owned here for good, as upstream keeps them.
-                **key != root && matches!(slot, LibSlot::Fresh(lib) if lib.swf.is_action_script_3())
+                // Under an AVM1 root (DragonFable, AdventureQuest, MechQuest) libraries stay owned
+                // for good, as upstream keeps them: DF crashed with them held weakly ("memory access
+                // out of bounds" in `Drawing::clone` while instantiating a library symbol, then
+                // "null function"). An AVM1 root only frees AVM2 movies' libraries.
+                **key != root
+                    && matches!(slot, LibSlot::Fresh(lib) if root_avm2 || lib.swf.is_action_script_3())
             })
             .map(|(key, _)| *key)
             .collect();
