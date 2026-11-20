@@ -2659,6 +2659,16 @@ impl Player {
             }
             MVS_GC_CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             MVS_GC_PASSES.store(passes, std::sync::atomic::Ordering::Relaxed);
+            // Go to the sweep now, whatever the collection debt says. `cycle_debt` alone returns
+            // without leaving the marked phase once the forced marking above has paid the debt, and
+            // the game then ran frames against a fully marked arena: what a loading movie added to
+            // its held library (marked, no write barrier) stayed unmarked, the next pass found the
+            // library alive and did not trace it again, and the sweep freed objects the library
+            // still pointed at ("memory access out of bounds" in `do_collection` or in
+            // `instantiate_display_object` while AQW loads a map).
+            if let Some(marked) = arena.finish_marking() {
+                marked.start_sweeping();
+            }
             // Sweep; never starts the next cycle's marking (that must go through mark_debt).
             arena.cycle_debt();
         } else if arena.collection_phase() == gc_arena::arena::CollectionPhase::Sweeping {
