@@ -1067,6 +1067,22 @@ export class InnerPlayer {
     }
 
     /**
+     * Frees GPU memory that the renderer can recreate; see `PlayerV1.releaseGpuResources`.
+     *
+     * @returns An estimate of the bytes freed.
+     */
+    releaseGpuResources(): number {
+        return this.instance?.release_gpu_resources() ?? 0;
+    }
+
+    /**
+     * Uploads again what `releaseGpuResources` freed.
+     */
+    restoreGpuResources(): void {
+        this.instance?.restore_gpu_resources();
+    }
+
+    /**
      * Checks if this player is allowed to be fullscreen by the browser.
      *
      * @returns True if you may call [[enterFullscreen]].

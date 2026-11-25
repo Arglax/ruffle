@@ -375,6 +375,17 @@ impl RuffleHandle {
         let _ = self.with_core_mut(|core| core.set_volume(value));
     }
 
+    /// Frees GPU memory the renderer can recreate; returns an estimate of the bytes freed.
+    pub fn release_gpu_resources(&self) -> f64 {
+        self.with_core_mut(|core| core.release_gpu_resources() as f64)
+            .unwrap_or(0.0)
+    }
+
+    /// Uploads again what `release_gpu_resources` freed (the next frame also does this).
+    pub fn restore_gpu_resources(&self) {
+        let _ = self.with_core_mut(|core| core.restore_gpu_resources());
+    }
+
     pub fn renderer_debug_info(&self) -> JsValue {
         self.with_core(|core| JsValue::from_str(&core.renderer().debug_info()))
             .unwrap_or(JsValue::NULL)

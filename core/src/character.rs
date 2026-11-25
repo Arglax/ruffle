@@ -10,7 +10,7 @@ use gc_arena::barrier::unlock;
 use gc_arena::lock::Lock;
 use gc_arena::{Collect, Gc, Mutation};
 use ruffle_render::backend::RenderBackend;
-use ruffle_render::bitmap::{Bitmap as RenderBitmap, BitmapHandle, BitmapSize};
+use ruffle_render::bitmap::{Bitmap as RenderBitmap, BitmapHandle, BitmapSize, PixelRegion};
 use ruffle_render::error::Error as RenderError;
 use swf::DefineBitsLossless;
 
@@ -78,6 +78,23 @@ impl<'gc> BitmapCharacter<'gc> {
         // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
         self.handle.set(new_handle.clone()).unwrap();
         Ok(new_handle)
+    }
+
+    /// Uploads this bitmap again if `RenderBackend::release_gpu_resources` emptied its texture.
+    pub fn restore_texture(&self, backend: &mut dyn RenderBackend) {
+        let Some(handle) = self.handle.get() else {
+            return;
+        };
+        if !backend.texture_needs_upload(handle) {
+            return;
+        }
+        let result = self.compressed.decode().and_then(|decoded| {
+            let region = PixelRegion::for_whole_size(decoded.width(), decoded.height());
+            backend.update_texture(handle, decoded, region)
+        });
+        if let Err(e) = result {
+            tracing::error!("Failed to restore bitmap texture: {e}");
+        }
     }
 }
 

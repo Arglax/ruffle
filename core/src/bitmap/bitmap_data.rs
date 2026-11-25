@@ -789,6 +789,23 @@ impl<'gc> BitmapRawData<'gc> {
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
         if let Some(ref handle) = self.bitmap_handle {
+            // `release_gpu_resources` emptied the texture: the CPU pixels are current unless the GPU
+            // wrote them, and the renderer never empties a texture it wrote.
+            if !matches!(self.dirty_state, DirtyState::GpuModified(..))
+                && renderer.texture_needs_upload(handle)
+            {
+                let handle = handle.clone();
+                let bitmap = Bitmap::new(
+                    self.width(),
+                    self.height(),
+                    BitmapFormat::Rgba,
+                    self.pixels_rgba(),
+                );
+                let region = PixelRegion::for_whole_size(self.width(), self.height());
+                renderer.update_texture(&handle, bitmap, region)?;
+                self.dirty_state = DirtyState::Clean;
+                return Ok(handle);
+            }
             return Ok(handle.clone());
         }
 

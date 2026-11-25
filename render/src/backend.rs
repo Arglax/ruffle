@@ -109,6 +109,26 @@ pub trait RenderBackend: Any {
 
     fn set_quality(&mut self, quality: StageQuality);
 
+    /// Frees GPU memory that can be recreated from CPU-side data, for an embedder that has stopped
+    /// drawing (a hidden tab or WebView). Bitmap textures are emptied but keep their GPU object, so
+    /// handles stay valid; the owner re-uploads them (see `texture_needs_upload`). Textures the GPU
+    /// wrote (`render_offscreen` targets, `create_empty_texture`) or that were marked with
+    /// `keep_texture_resident` are kept. Returns an estimate of the bytes freed. Default: nothing.
+    fn release_gpu_resources(&mut self) -> usize {
+        0
+    }
+
+    /// Recreates the renderer's own buffers freed by `release_gpu_resources` (not bitmap textures).
+    fn restore_gpu_resources(&mut self) {}
+
+    /// Whether `release_gpu_resources` emptied this texture and it needs a full `update_texture`.
+    fn texture_needs_upload(&self, _handle: &BitmapHandle) -> bool {
+        false
+    }
+
+    /// Excludes this texture from `release_gpu_resources`: its owner cannot upload it again.
+    fn keep_texture_resident(&mut self, _handle: &BitmapHandle) {}
+
     fn compile_pixelbender_shader(
         &mut self,
         shader: PixelBenderShader,

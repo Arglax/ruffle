@@ -206,6 +206,10 @@ pub struct WebGlRenderBackend {
     target_pool: Vec<PooledTarget>,
     /// Where drawing goes now while rendering offscreen (innermost last).
     targets: Vec<ActiveTarget>,
+    /// Every texture made by `register_bitmap`, for `release_gpu_resources`.
+    textures: Vec<std::sync::Weak<dyn BitmapHandleImpl>>,
+    /// Live entries in `textures` after it was last pruned.
+    textures_live: usize,
 }
 
 struct BlendProgram {
@@ -255,6 +259,11 @@ struct RegistryData {
     /// MVS: the filter and wrap last set on this texture (u64::MAX: not yet), so a draw that binds
     /// it with the same ones doesn't set four texture parameters again.
     mvs_params: std::cell::Cell<u64>,
+    /// `release_gpu_resources` shrank this texture to 1x1; the next `update_texture` fills it again.
+    evicted: std::cell::Cell<bool>,
+    /// Never emptied: the GPU wrote it (cacheAsBitmap, `BitmapData.draw`) or its owner cannot
+    /// upload it again (`keep_texture_resident`).
+    resident: std::cell::Cell<bool>,
 }
 
 impl RegistryData {
@@ -446,6 +455,8 @@ impl WebGlRenderBackend {
             blend_program,
             offscreen_depth: 0,
             target_pool: vec![],
+            textures: vec![],
+            textures_live: 0,
             targets: vec![],
             mult_color: None,
             add_color: None,
@@ -1940,6 +1951,7 @@ impl RenderBackend for WebGlRenderBackend {
         quality: StageQuality,
         bounds: PixelRegion,
     ) -> Option<Box<dyn SyncHandle>> {
+        as_registry_data(&handle).resident.set(true);
         let view_matrix = self.view_matrix;
         let mut framebuffers = vec![];
         let mut renderbuffers = vec![];
@@ -2119,13 +2131,21 @@ impl RenderBackend for WebGlRenderBackend {
         self.gl
             .tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
 
-        Ok(BitmapHandle(Arc::new(RegistryData {
+        let handle = BitmapHandle(Arc::new(RegistryData {
             mvs_params: std::cell::Cell::new(u64::MAX),
             gl: self.gl.clone(),
             width: bitmap.width(),
             height: bitmap.height(),
             texture,
-        })))
+            evicted: std::cell::Cell::new(false),
+            resident: std::cell::Cell::new(false),
+        }));
+        if self.textures.len() >= self.textures_live * 2 + 64 {
+            self.textures.retain(|weak| weak.strong_count() > 0);
+            self.textures_live = self.textures.len();
+        }
+        self.textures.push(Arc::downgrade(&handle.0));
+        Ok(handle)
     }
 
     fn update_texture(
@@ -2134,7 +2154,9 @@ impl RenderBackend for WebGlRenderBackend {
         bitmap: Bitmap<'_>,
         _region: PixelRegion,
     ) -> Result<(), BitmapError> {
-        let texture = &as_registry_data(handle).texture;
+        let entry = as_registry_data(handle);
+        entry.evicted.set(false);
+        let texture = &entry.texture;
 
         self.gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
 
@@ -2231,6 +2253,87 @@ impl RenderBackend for WebGlRenderBackend {
         }
         if let Err(e) = self.build_msaa_buffers() {
             log::error!("Couldn't rebuild MSAA buffers for quality {quality:?}: {e}");
+        }
+    }
+
+    fn release_gpu_resources(&mut self) -> usize {
+        self.flush_batch();
+        let mut freed = 0usize;
+
+        // Bitmap textures: shrink to 1x1 instead of deleting, so every handle (and every shape draw
+        // that holds one) still names a valid texture; `update_texture` fills it again.
+        self.textures.retain(|weak| weak.strong_count() > 0);
+        self.textures_live = self.textures.len();
+        for weak in &self.textures {
+            let Some(handle) = weak.upgrade() else {
+                continue;
+            };
+            let Some(entry) = <dyn Any>::downcast_ref::<RegistryData>(&*handle) else {
+                continue;
+            };
+            if entry.resident.get() || entry.evicted.get() {
+                continue;
+            }
+            self.gl.bind_texture(Gl::TEXTURE_2D, Some(&entry.texture));
+            let shrunk = self
+                .gl
+                .tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                    Gl::TEXTURE_2D,
+                    0,
+                    Gl::RGBA as i32,
+                    1,
+                    1,
+                    0,
+                    Gl::RGBA,
+                    Gl::UNSIGNED_BYTE,
+                    None,
+                );
+            if shrunk.is_ok() {
+                entry.evicted.set(true);
+                freed += entry.width as usize * entry.height as usize * 4;
+            }
+        }
+        self.gl.bind_texture(Gl::TEXTURE_2D, None);
+
+        // Offscreen targets kept between frames: recreated on demand by `acquire_target`.
+        if self.targets.is_empty() {
+            for t in std::mem::take(&mut self.target_pool) {
+                freed += t.width as usize * t.height as usize * 4 * (t.samples.max(1) as usize + 1);
+                self.delete_pooled(t);
+            }
+        }
+
+        // The multisampled stage buffers: rebuilt by `restore_gpu_resources`.
+        if let Some(msaa) = self.msaa_buffers.take() {
+            let gl = &self.gl;
+            gl.delete_renderbuffer(Some(&msaa.color_renderbuffer));
+            gl.delete_renderbuffer(Some(&msaa.stencil_renderbuffer));
+            gl.delete_framebuffer(Some(&msaa.render_framebuffer));
+            gl.delete_framebuffer(Some(&msaa.color_framebuffer));
+            gl.delete_texture(Some(&msaa.framebuffer_texture));
+            let pixels = self.renderbuffer_width.max(0) as usize * self.renderbuffer_height.max(0) as usize;
+            freed += pixels * 4 * (self.msaa_sample_count as usize * 2 + 1);
+            gl.bind_framebuffer(Gl::FRAMEBUFFER, None);
+        }
+
+        freed
+    }
+
+    fn restore_gpu_resources(&mut self) {
+        if self.msaa_buffers.is_none() {
+            if let Err(e) = self.build_msaa_buffers() {
+                log::error!("Unable to rebuild MSAA buffers: {e:?}");
+            }
+        }
+    }
+
+    fn texture_needs_upload(&self, handle: &BitmapHandle) -> bool {
+        <dyn Any>::downcast_ref::<RegistryData>(&*handle.0).is_some_and(|entry| entry.evicted.get())
+    }
+
+    fn keep_texture_resident(&mut self, handle: &BitmapHandle) {
+        if let Some(entry) = <dyn Any>::downcast_ref::<RegistryData>(&*handle.0) {
+            entry.resident.set(true);
         }
     }
 
@@ -2333,6 +2436,8 @@ impl RenderBackend for WebGlRenderBackend {
             width: width.get(),
             height: height.get(),
             texture,
+            evicted: std::cell::Cell::new(false),
+            resident: std::cell::Cell::new(true),
         })))
     }
 }
