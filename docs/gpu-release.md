@@ -60,10 +60,37 @@ Core re-uploads:
 Web API (`PlayerV1`, `player.ruffle()`): `releaseGpuResources(): number` and
 `restoreGpuResources(): void`.
 
-## Expected savings
+## Measured (Poco X6 Pro, Mali-G615, Android 16, MVS mvs-1.0.6, CI build of 5377a0b0)
+
+Hidden AQW army client, `dumpsys meminfo`, in MB:
+
+| Step | Graphics | Total PSS |
+| --- | --- | --- |
+| Before (visible-sized canvas) | 568 | 1119 |
+| Page ratio 0.25 + `releaseGpuResources` (reported ~146 MB of textures/targets/MSAA, plus shape tessellations) | 464 | 998 |
+| Player `visibility:hidden` | 464 | 998 |
+| WebGL canvas `width = height = 1` | 145 | 669 |
+| Chromium critical memory pressure (`Application.onTrimMemory`) | 145 | 663 |
+
+Afterwards GL mtrack was 128 MB. Restoring (canvas size back, ratio back) redrew correctly with
+no errors.
+
+So the largest holder was not Ruffle's own objects but the WebGL drawing buffer and Chromium's
+copies of it (shared-image / mailbox backings), which stay allocated at the canvas size even when
+nothing is drawn. Shrinking the canvas is an embedder-side step (no Ruffle change needed; Ruffle
+must just not be asked to render meanwhile). Ruffle's release adds ~100 MB on top. Hiding the
+element and memory pressure freed nothing measurable.
+
+A possible upstream follow-up: have the release API (or a `gpuReleaseWhenHidden` option) also
+set the canvas to 1x1 and let the next resize restore it.
+
+## Expected savings (before measuring)
 
 Estimates for a hidden AQW client (to be measured with `dumpsys meminfo` "Graphics"):
 
+- Shape tessellations (added in 5377a0b0): `Library::release_shape_meshes` drops every
+  `Graphic` character's tessellation cache, so the vertex buffers go; shapes tessellate again when
+  next drawn.
 - Bitmap textures: SWF bitmaps of the town map, UI, loaded gear/pets — the bulk; estimated
   150-300 MB on a busy map (each 1024x1024 RGBA texture is 4 MB, plus driver padding).
 - Offscreen target pool: up to 24 pooled targets with MSAA renderbuffers and blend layers;
