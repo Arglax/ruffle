@@ -46,6 +46,16 @@ pub struct GraphicData<'gc> {
 }
 
 impl<'gc> Graphic<'gc> {
+    /// Drops this shape's cached tessellations (and so their GPU vertex buffers, once no frame
+    /// holds them); the next render tessellates again. Returns how many were dropped.
+    pub fn release_tessellations(self) -> usize {
+        let shared = self.0.shared.get();
+        let mut cache = shared.scaled_handle.borrow_mut();
+        let count = cache.len();
+        *cache = TessellationCache::new();
+        count
+    }
+
     /// Construct a `Graphic` from it's associated `Shape` tag.
     pub fn from_swf_tag(
         context: &mut UpdateContext<'gc>,

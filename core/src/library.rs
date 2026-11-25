@@ -490,6 +490,19 @@ impl<'gc> MovieLibraries<'gc> {
         self.slots.values().map(|slot| slot.library().swf)
     }
 
+    /// Drops the cached tessellations of every shape character (see `Graphic::release_tessellations`).
+    fn release_shapes(&self) -> usize {
+        let mut count = 0;
+        for slot in self.slots.values() {
+            for character in slot.library().characters.values() {
+                if let Character::Graphic(graphic) = character {
+                    count += graphic.release_tessellations();
+                }
+            }
+        }
+        count
+    }
+
     /// Uploads again every bitmap character texture that `release_gpu_resources` emptied.
     fn restore_textures(&self, backend: &mut dyn RenderBackend) {
         for slot in self.slots.values() {
@@ -540,6 +553,12 @@ pub struct Library<'gc> {
 
 impl<'gc> Library<'gc> {
     /// Uploads again the bitmap character textures that `RenderBackend::release_gpu_resources` emptied.
+    /// Drops the cached tessellations of every shape character: their vertex buffers go back to the
+    /// GPU and the next frame tessellates the shapes it draws again. Returns how many were dropped.
+    pub fn release_shape_meshes(&self) -> usize {
+        self.movie_libraries.release_shapes()
+    }
+
     pub fn restore_gpu_textures(&self, backend: &mut dyn RenderBackend) {
         self.movie_libraries.restore_textures(backend);
     }

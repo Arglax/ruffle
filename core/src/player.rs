@@ -2362,6 +2362,8 @@ impl Player {
     /// (a hidden page). The next `render` (or `restore_gpu_resources`) uploads it again. Returns an
     /// estimate of the bytes freed; 0 if the backend does not support it.
     pub fn release_gpu_resources(&mut self) -> usize {
+        let shapes = self.enter_arena_mut(|_, gc_root, _| gc_root.library.release_shape_meshes());
+        tracing::info!("release_gpu_resources: dropped {shapes} shape tessellations");
         let freed = self.renderer.release_gpu_resources();
         self.gpu_released = true;
         freed
