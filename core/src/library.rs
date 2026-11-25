@@ -489,6 +489,17 @@ impl<'gc> MovieLibraries<'gc> {
     fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
         self.slots.values().map(|slot| slot.library().swf)
     }
+
+    /// Uploads again every bitmap character texture that `release_gpu_resources` emptied.
+    fn restore_textures(&self, backend: &mut dyn RenderBackend) {
+        for slot in self.slots.values() {
+            for character in slot.library().characters.values() {
+                if let Character::Bitmap(bitmap) = character {
+                    bitmap.restore_texture(backend);
+                }
+            }
+        }
+    }
 }
 
 /// Symbol library for multiple movies.
@@ -528,6 +539,11 @@ pub struct Library<'gc> {
 }
 
 impl<'gc> Library<'gc> {
+    /// Uploads again the bitmap character textures that `RenderBackend::release_gpu_resources` emptied.
+    pub fn restore_gpu_textures(&self, backend: &mut dyn RenderBackend) {
+        self.movie_libraries.restore_textures(backend);
+    }
+
     pub fn empty() -> Self {
         Self {
             movie_libraries: MovieLibraries::new(),

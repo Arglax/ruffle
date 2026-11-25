@@ -96,6 +96,22 @@ export interface PlayerV1 {
     set volume(value: number);
 
     /**
+     * Frees GPU memory that Ruffle can recreate (bitmap textures, cached offscreen buffers,
+     * multisample buffers), for a page that has stopped showing the player for a while but must
+     * keep its scripts running. Nothing changes until the next frame is drawn, which uploads it
+     * all again (one slower frame). Calling {@link restoreGpuResources} first moves that work
+     * out of the frame. Does nothing on renderers that do not support it.
+     *
+     * @returns An estimate of the bytes freed (0 if unsupported).
+     */
+    releaseGpuResources(): number;
+
+    /**
+     * Uploads again what {@link releaseGpuResources} freed. Optional: the next frame does it anyway.
+     */
+    restoreGpuResources(): void;
+
+    /**
      * Checks if this player is allowed to be fullscreen by the browser.
      *
      * @returns True if you may call {@link requestFullscreen}.

@@ -76,6 +76,8 @@ pub fn begin_bitmap_fill<'gc>(
         let is_smoothed = args.get_bool(3);
 
         let handle = bitmap.bitmap_handle(activation.gc(), activation.context.renderer);
+        // Shapes keep this handle; nothing re-uploads it after `release_gpu_resources`.
+        activation.context.renderer.keep_texture_resident(&handle);
 
         let bitmap = ruffle_render::bitmap::BitmapInfo {
             handle,
@@ -1328,6 +1330,8 @@ pub fn line_bitmap_style<'gc>(
         let is_smoothed = args.get_bool(3);
 
         let handle = bitmap.bitmap_handle(activation.gc(), activation.context.renderer);
+        // Shapes keep this handle; nothing re-uploads it after `release_gpu_resources`.
+        activation.context.renderer.keep_texture_resident(&handle);
 
         let bitmap = ruffle_render::bitmap::BitmapInfo {
             handle,
@@ -1802,6 +1806,8 @@ fn handle_bitmap_fill<'gc>(
         .coerce_to_boolean();
 
     let handle = bitmap_data.bitmap_handle(activation.gc(), activation.context.renderer);
+    // Shapes keep this handle; nothing re-uploads it after `release_gpu_resources`.
+    activation.context.renderer.keep_texture_resident(&handle);
 
     let bitmap = ruffle_render::bitmap::BitmapInfo {
         handle,

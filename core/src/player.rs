@@ -341,6 +341,9 @@ pub struct Player {
     run_state: RunState,
     needs_render: bool,
 
+    /// `release_gpu_resources` ran and `restore_gpu_resources` has not yet.
+    gpu_released: bool,
+
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
     navigator: Box<dyn NavigatorBackend>,
@@ -2262,6 +2265,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn render(&mut self) {
+        self.restore_gpu_resources();
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
@@ -2352,6 +2356,28 @@ impl Player {
 
     pub fn renderer_mut(&mut self) -> &mut dyn RenderBackend {
         &mut *self.renderer
+    }
+
+    /// Frees GPU memory the renderer can recreate, for an embedder that has stopped calling `render`
+    /// (a hidden page). The next `render` (or `restore_gpu_resources`) uploads it again. Returns an
+    /// estimate of the bytes freed; 0 if the backend does not support it.
+    pub fn release_gpu_resources(&mut self) -> usize {
+        let freed = self.renderer.release_gpu_resources();
+        self.gpu_released = true;
+        freed
+    }
+
+    /// Undoes `release_gpu_resources`: re-uploads bitmap character textures and recreates the
+    /// renderer's buffers. BitmapData textures are re-uploaded lazily when next used. Called by
+    /// `render` itself, so calling it ahead of time only moves the work out of the first frame.
+    pub fn restore_gpu_resources(&mut self) {
+        if !std::mem::take(&mut self.gpu_released) {
+            return;
+        }
+        self.renderer.restore_gpu_resources();
+        self.enter_arena_mut(|_, gc_root, this| {
+            gc_root.library.restore_gpu_textures(this.renderer.deref_mut());
+        });
     }
 
     pub fn storage(&self) -> &dyn StorageBackend {
@@ -3339,6 +3365,7 @@ impl PlayerBuilder {
                     RunState::Suspended
                 },
                 needs_render: true,
+                gpu_released: false,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),
