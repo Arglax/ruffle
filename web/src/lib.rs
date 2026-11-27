@@ -1385,7 +1385,7 @@ impl RuffleHandle {
                 let wasm_mb = core::arch::wasm32::memory_size(0) * 65536 / 1_048_576;
                 let live_mb = mvs_alloc::live() / 1_048_576;
                 let peak_mb = mvs_alloc::peak() / 1_048_576;
-                let report = format!("wasm {wasm_mb} MB (live {live_mb} MB, peak {peak_mb} MB), {}", core.mvs_mem());
+                let report = format!("wasm {wasm_mb} MB (live {live_mb} MB, peak {peak_mb} MB; {}), {}", mvs_alloc::buckets(), core.mvs_mem());
                 let _ = js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("__mvsMem"), &JsValue::from_str(&report));
             }
             if core.mvs_frames_run() != frames_before
