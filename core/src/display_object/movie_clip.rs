@@ -489,6 +489,7 @@ impl<'gc> MovieClip<'gc> {
         context: &mut UpdateContext<'gc>,
         chunk_limit: &mut ExecutionLimit,
     ) -> bool {
+        let _phase = ruffle_render::mvs_phase::enter(ruffle_render::mvs_phase::LOAD);
         let shared = Gc::as_ref(self.0.shared.get());
         let (swf, progress) = (&shared.swf_data, &shared.preload_progress);
 

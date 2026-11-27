@@ -51,6 +51,7 @@ impl ShapeTessellator {
         bitmap_source: &dyn BitmapSource,
         scale: f32,
     ) -> Mesh {
+        let _phase = crate::mvs_phase::enter(crate::mvs_phase::TESSELLATE);
         self.mesh = Vec::new();
         self.gradients = IndexSet::new();
         self.lyon_mesh = VertexBuffers::new();

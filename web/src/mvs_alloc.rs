@@ -46,9 +46,57 @@ fn grow(by: usize) {
     PEAK.fetch_max(now, Relaxed);
 }
 
+/// Allocations of this size or more carry a small header naming the player phase that made them
+/// (ruffle_render::mvs_phase), so the report can say which part of the player holds the big buffers.
+const BIG: usize = 65536;
+
+static PHASE_BYTES: [AtomicUsize; ruffle_render::mvs_phase::COUNT] =
+    [const { AtomicUsize::new(0) }; ruffle_render::mvs_phase::COUNT];
+
+#[inline]
+fn header(layout: Layout) -> usize {
+    layout.align().max(16)
+}
+
+unsafe fn alloc_big(layout: Layout, zeroed: bool) -> *mut u8 {
+    let h = header(layout);
+    let Ok(outer) = Layout::from_size_align(layout.size() + h, h) else {
+        return std::ptr::null_mut();
+    };
+    let base = unsafe {
+        if zeroed {
+            System.alloc_zeroed(outer)
+        } else {
+            System.alloc(outer)
+        }
+    };
+    if base.is_null() {
+        return base;
+    }
+    let phase = ruffle_render::mvs_phase::current().min(ruffle_render::mvs_phase::COUNT as u8 - 1);
+    unsafe { base.write(phase) };
+    PHASE_BYTES[phase as usize].fetch_add(layout.size(), Relaxed);
+    unsafe { base.add(h) }
+}
+
+unsafe fn dealloc_big(ptr: *mut u8, layout: Layout) {
+    let h = header(layout);
+    let base = unsafe { ptr.sub(h) };
+    let phase = unsafe { base.read() } as usize;
+    if let Some(bytes) = PHASE_BYTES.get(phase) {
+        bytes.fetch_sub(layout.size(), Relaxed);
+    }
+    let outer = unsafe { Layout::from_size_align_unchecked(layout.size() + h, h) };
+    unsafe { System.dealloc(base, outer) };
+}
+
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
+        let ptr = if layout.size() >= BIG {
+            unsafe { alloc_big(layout, false) }
+        } else {
+            unsafe { System.alloc(layout) }
+        };
         if !ptr.is_null() {
             grow(layout.size());
             add(layout.size());
@@ -57,7 +105,11 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
+        let ptr = if layout.size() >= BIG {
+            unsafe { alloc_big(layout, true) }
+        } else {
+            unsafe { System.alloc_zeroed(layout) }
+        };
         if !ptr.is_null() {
             grow(layout.size());
             add(layout.size());
@@ -66,24 +118,55 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) };
+        if layout.size() >= BIG {
+            unsafe { dealloc_big(ptr, layout) };
+        } else {
+            unsafe { System.dealloc(ptr, layout) };
+        }
         LIVE.fetch_sub(layout.size(), Relaxed);
         remove(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if layout.size() < BIG && new_size < BIG {
+            let new = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new.is_null() {
+                remove(layout.size());
+                add(new_size);
+                if new_size >= layout.size() {
+                    grow(new_size - layout.size());
+                } else {
+                    LIVE.fetch_sub(layout.size() - new_size, Relaxed);
+                }
+            }
+            return new;
+        }
+        // Either side is big (has a header): move it.
+        let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+            return std::ptr::null_mut();
+        };
+        let new = unsafe { self.alloc(new_layout) };
         if !new.is_null() {
-            remove(layout.size());
-            add(new_size);
-            if new_size >= layout.size() {
-                grow(new_size - layout.size());
-            } else {
-                LIVE.fetch_sub(layout.size() - new_size, Relaxed);
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
+                self.dealloc(ptr, layout);
             }
         }
         new
     }
+}
+
+/// "render 12 MB, script 40 MB, ..." for big (64 KB+) allocations still alive.
+pub fn phases() -> String {
+    let mut out = String::new();
+    for (i, name) in ruffle_render::mvs_phase::NAMES.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let mb = PHASE_BYTES[i].load(Relaxed) as f64 / 1_048_576.0;
+        out.push_str(&format!("{name} {mb:.0} MB"));
+    }
+    out
 }
 
 /// Bytes allocated and not yet freed.

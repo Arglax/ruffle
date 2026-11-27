@@ -127,6 +127,7 @@ impl CompressedBitmap {
         }
     }
     pub fn decode(&self) -> Result<RenderBitmap<'static>, RenderError> {
+        let _phase = ruffle_render::mvs_phase::enter(ruffle_render::mvs_phase::DECODE);
         match self {
             CompressedBitmap::Jpeg {
                 data,

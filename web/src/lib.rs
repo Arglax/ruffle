@@ -1349,7 +1349,10 @@ impl RuffleHandle {
             }
 
             let frames_before = core.mvs_frames_run();
-            core.tick(FloatDuration::from_millis(dt));
+            {
+                let _phase = ruffle_render::mvs_phase::enter(ruffle_render::mvs_phase::SCRIPT);
+                core.tick(FloatDuration::from_millis(dt));
+            }
             // MVS: window.__mvsCensus = true asks once for a count of what the frame loop visits.
             if let Some(window) = &mvs_window
                 && js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("__mvsCensus"))
@@ -1385,7 +1388,7 @@ impl RuffleHandle {
                 let wasm_mb = core::arch::wasm32::memory_size(0) * 65536 / 1_048_576;
                 let live_mb = mvs_alloc::live() / 1_048_576;
                 let peak_mb = mvs_alloc::peak() / 1_048_576;
-                let report = format!("wasm {wasm_mb} MB (live {live_mb} MB, peak {peak_mb} MB; {}), {}", mvs_alloc::buckets(), core.mvs_mem());
+                let report = format!("wasm {wasm_mb} MB (live {live_mb} MB, peak {peak_mb} MB; {}; big by part: {}), {}", mvs_alloc::buckets(), mvs_alloc::phases(), core.mvs_mem());
                 let _ = js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("__mvsMem"), &JsValue::from_str(&report));
             }
             if core.mvs_frames_run() != frames_before
@@ -1407,10 +1410,12 @@ impl RuffleHandle {
             if mvs_interp_hz > 0.0 && new_dimensions.is_none() {
                 // MVS in-betweening: also draw between game frames, at most mvs_interp_hz a second.
                 if core.needs_render() || mvs_since_render >= 1000.0 / mvs_interp_hz - 2.0 {
+                    let _phase = ruffle_render::mvs_phase::enter(ruffle_render::mvs_phase::RENDER);
                     core.render_interpolated();
                     mvs_rendered = true;
                 }
             } else if core.needs_render() || new_dimensions.is_some() {
+                let _phase = ruffle_render::mvs_phase::enter(ruffle_render::mvs_phase::RENDER);
                 core.render();
                 mvs_rendered = true;
             }

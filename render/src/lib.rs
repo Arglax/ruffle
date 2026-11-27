@@ -8,6 +8,7 @@ pub mod error;
 pub mod filters;
 pub mod lines;
 pub mod matrix;
+pub mod mvs_phase;
 pub mod matrix3d;
 pub mod perspective_projection;
 pub mod pixel_bender_support;
