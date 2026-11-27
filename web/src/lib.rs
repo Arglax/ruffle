@@ -1,6 +1,12 @@
 #![deny(clippy::unwrap_used)]
 
 //! Ruffle web frontend.
+#[cfg(target_arch = "wasm32")]
+mod mvs_alloc;
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static MVS_ALLOC: mvs_alloc::Counting = mvs_alloc::Counting;
+
 mod audio;
 mod builder;
 mod external_interface;
@@ -1377,7 +1383,9 @@ impl RuffleHandle {
                 && let Some(window) = &mvs_window
             {
                 let wasm_mb = core::arch::wasm32::memory_size(0) * 65536 / 1_048_576;
-                let report = format!("wasm {wasm_mb} MB, {}", core.mvs_mem());
+                let live_mb = mvs_alloc::live() / 1_048_576;
+                let peak_mb = mvs_alloc::peak() / 1_048_576;
+                let report = format!("wasm {wasm_mb} MB (live {live_mb} MB, peak {peak_mb} MB), {}", core.mvs_mem());
                 let _ = js_sys::Reflect::set(window.as_ref(), &JsValue::from_str("__mvsMem"), &JsValue::from_str(&report));
             }
             if core.mvs_frames_run() != frames_before
